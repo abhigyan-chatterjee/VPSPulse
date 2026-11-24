@@ -206,6 +206,48 @@ func TestDockerPolicyAndVPSOfflineTransitions(t *testing.T) {
 	}
 }
 
+func TestAutoResolveRemovedContainerAndClearedSystemdIncident(t *testing.T) {
+	st, _, _, alerts, _ := newTestHub(t)
+	v, _, _ := st.CreateVPS("cleanup-node", "in")
+
+	now := time.Now()
+	hbBad := protocol.HeartbeatPayload{
+		Timestamp:        now,
+		Host:             protocol.HostMeta{Hostname: "cleanup-node"},
+		Metrics:          protocol.HostMetrics{CPUPercent: 10, RAMUsedBytes: 100, RAMTotalBytes: 1000},
+		DockerAvailable:  true,
+		Containers:       []protocol.DockerContainerReport{{ID: "dead1", Name: "nostalgic_bhabha", Image: "node", State: "exited", ExitCode: 1}},
+		SystemdAvailable: true,
+		SystemdUnits:     []protocol.SystemdUnitReport{{Name: "certbot.service", ActiveState: "failed", SubState: "failed", AutoFailed: true}},
+	}
+	if err := st.RecordHeartbeat(v.ID, hbBad); err != nil {
+		t.Fatalf("RecordHeartbeat bad: %v", err)
+	}
+	vBad, _ := st.GetVPS(v.ID)
+	alerts.EvaluateHeartbeat(*vBad, hbBad, now)
+
+	openIncs, _ := st.ListIncidents("open", 50)
+	if len(openIncs) != 2 {
+		t.Fatalf("expected 2 open incidents (container + systemd), got %d: %+v", len(openIncs), openIncs)
+	}
+
+	// Next heartbeat after container prune and certbot reset-failed reports neither.
+	hbClean := hbBad
+	hbClean.Timestamp = now.Add(10 * time.Second)
+	hbClean.Containers = nil
+	hbClean.SystemdUnits = nil
+	if err := st.RecordHeartbeat(v.ID, hbClean); err != nil {
+		t.Fatalf("RecordHeartbeat clean: %v", err)
+	}
+	vClean, _ := st.GetVPS(v.ID)
+	alerts.EvaluateHeartbeat(*vClean, hbClean, now.Add(10*time.Second))
+
+	openAfter, _ := st.ListIncidents("open", 50)
+	if len(openAfter) != 0 {
+		t.Fatalf("expected 0 open incidents after container removal & systemd reset, got %+v", openAfter)
+	}
+}
+
 func TestServerAuthHeartbeatAndInstallScript(t *testing.T) {
 	_, _, _, _, srv := newTestHub(t)
 	ts := httptest.NewServer(srv.Handler())

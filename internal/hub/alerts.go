@@ -101,8 +101,10 @@ func (a *AlertManager) EvaluateHeartbeat(vps store.VPS, payload protocol.Heartbe
 	if payload.DockerAvailable {
 		containers, err := a.store.ListContainers(vps.ID)
 		if err == nil {
+			activeDockerKeys := make(map[string]bool, len(containers))
 			for _, c := range containers {
 				key := fmt.Sprintf("docker:%s:%s", vps.ID, c.Name)
+				activeDockerKeys[key] = true
 				if c.Muted {
 					if inc, resolved, err := a.store.ResolveIncidentByKey(key, "Container muted"); err == nil && resolved && a.broker != nil {
 						a.broker.Publish("incident_update", inc)
@@ -130,6 +132,11 @@ func (a *AlertManager) EvaluateHeartbeat(vps store.VPS, payload protocol.Heartbe
 					}
 				}
 			}
+			if resolvedList, err := a.store.ResolveStaleIncidentsByPrefix("docker:"+vps.ID+":", activeDockerKeys, "Container removed from host"); err == nil && a.broker != nil {
+				for i := range resolvedList {
+					a.broker.Publish("incident_update", &resolvedList[i])
+				}
+			}
 		}
 	}
 
@@ -137,8 +144,10 @@ func (a *AlertManager) EvaluateHeartbeat(vps store.VPS, payload protocol.Heartbe
 	if payload.SystemdAvailable {
 		units, err := a.store.ListSystemdUnits(vps.ID)
 		if err == nil {
+			activeSystemdKeys := make(map[string]bool, len(units))
 			for _, u := range units {
 				key := fmt.Sprintf("systemd:%s:%s", vps.ID, u.Name)
+				activeSystemdKeys[key] = true
 				if u.ActiveState == "failed" || (u.Watched && u.ActiveState != "active") {
 					title := fmt.Sprintf("systemd unit %s on %s is %s", u.Name, vps.Name, u.ActiveState)
 					detail := fmt.Sprintf("SubState: %s (auto_failed=%v)", u.SubState, u.AutoFailed)
@@ -156,6 +165,11 @@ func (a *AlertManager) EvaluateHeartbeat(vps store.VPS, payload protocol.Heartbe
 							a.broker.Publish("incident_update", inc)
 						}
 					}
+				}
+			}
+			if resolvedList, err := a.store.ResolveStaleIncidentsByPrefix("systemd:"+vps.ID+":", activeSystemdKeys, "systemd unit cleared"); err == nil && a.broker != nil {
+				for i := range resolvedList {
+					a.broker.Publish("incident_update", &resolvedList[i])
 				}
 			}
 		}

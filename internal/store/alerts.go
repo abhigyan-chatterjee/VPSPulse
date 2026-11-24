@@ -260,6 +260,49 @@ func (s *Store) ResolveIncidentByKey(incidentKey, detail string) (*Incident, boo
 	return inc, true, err
 }
 
+// ResolveStaleIncidentsByPrefix resolves any open/acknowledged incidents whose key starts with prefix and is not in activeKeys.
+func (s *Store) ResolveStaleIncidentsByPrefix(prefix string, activeKeys map[string]bool, detail string) ([]Incident, error) {
+	rows, err := s.db.Query(
+		`SELECT id, incident_key FROM incidents
+		 WHERE status IN ('open', 'acknowledged') AND SUBSTR(incident_key, 1, ?) = ?`,
+		len(prefix), prefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var toResolve []string
+	for rows.Next() {
+		var id, key string
+		if err := rows.Scan(&id, &key); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if !activeKeys[key] {
+			toResolve = append(toResolve, id)
+		}
+	}
+	_ = rows.Close()
+
+	if len(toResolve) == 0 {
+		return nil, nil
+	}
+
+	now := time.Now().Unix()
+	var resolved []Incident
+	for _, id := range toResolve {
+		if _, err := s.db.Exec(
+			`UPDATE incidents SET status = 'resolved', detail = ?, updated_at = ?, resolved_at = ? WHERE id = ?`,
+			detail, now, now, id,
+		); err != nil {
+			return resolved, err
+		}
+		if inc, err := s.getIncident(id); err == nil {
+			resolved = append(resolved, *inc)
+		}
+	}
+	return resolved, nil
+}
+
 // AcknowledgeIncident transitions an open incident to acknowledged.
 func (s *Store) AcknowledgeIncident(id string) error {
 	res, err := s.db.Exec(
