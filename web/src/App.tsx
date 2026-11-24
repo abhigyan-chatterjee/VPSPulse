@@ -10,6 +10,25 @@ import { VpsDetailPage } from "./pages/VpsDetailPage";
 import { IncidentsPage } from "./pages/IncidentsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
+function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
+  let replaced = false;
+  const out: T[] = [];
+  for (const existing of list) {
+    if (existing.id === item.id) {
+      if (!replaced) {
+        out.push(item);
+        replaced = true;
+      }
+    } else {
+      out.push(existing);
+    }
+  }
+  if (!replaced) {
+    out.push(item);
+  }
+  return out;
+}
+
 export function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [view, setView] = useState<TopView>("overview");
@@ -74,13 +93,7 @@ export function App() {
     es.addEventListener("vps_update", (ev) => {
       try {
         const updated = JSON.parse((ev as MessageEvent).data) as VPS;
-        setVpsList((prev) => {
-          const idx = prev.findIndex((x) => x.id === updated.id);
-          if (idx === -1) return [...prev, updated];
-          const next = [...prev];
-          next[idx] = updated;
-          return next;
-        });
+        setVpsList((prev) => upsertById(prev, updated));
       } catch {
         // ignore malformed event
       }
@@ -95,23 +108,23 @@ export function App() {
       try {
         const prb = JSON.parse((ev as MessageEvent).data) as Probe;
         if (!prb.vps_id) {
-          setStandaloneProbes((prev) => {
-            const idx = prev.findIndex((x) => x.id === prb.id);
-            if (idx === -1) return [...prev, prb];
-            const next = [...prev];
-            next[idx] = prb;
-            return next;
-          });
+          setStandaloneProbes((prev) => upsertById(prev, prb));
         } else {
           setVpsList((prev) =>
-            prev.map((v) => {
-              if (v.id !== prb.vps_id) return v;
-              const idx = v.probes.findIndex((p) => p.id === prb.id);
-              const probes = idx === -1 ? [...v.probes, prb] : v.probes.map((p) => (p.id === prb.id ? prb : p));
-              return { ...v, probes };
-            }),
+            prev.map((v) =>
+              v.id === prb.vps_id ? { ...v, probes: upsertById(v.probes, prb) } : v,
+            ),
           );
         }
+      } catch {}
+    });
+    es.addEventListener("probe_deleted", (ev) => {
+      try {
+        const { id } = JSON.parse((ev as MessageEvent).data) as { id: string };
+        setStandaloneProbes((prev) => prev.filter((p) => p.id !== id));
+        setVpsList((prev) =>
+          prev.map((v) => ({ ...v, probes: v.probes.filter((p) => p.id !== id) })),
+        );
       } catch {}
     });
     es.addEventListener("incident_update", (ev) => {
@@ -219,7 +232,7 @@ export function App() {
         open={addVpsOpen}
         publicUrl={auth.public_url}
         onClose={() => setAddVpsOpen(false)}
-        onCreated={(v) => setVpsList((prev) => [...prev, v])}
+        onCreated={(v) => setVpsList((prev) => upsertById(prev, v))}
         onToast={showToast}
       />
 
@@ -229,10 +242,12 @@ export function App() {
         onClose={() => setProbeModalVpsId(undefined)}
         onCreated={(prb) => {
           if (!prb.vps_id) {
-            setStandaloneProbes((prev) => [...prev, prb]);
+            setStandaloneProbes((prev) => upsertById(prev, prb));
           } else {
             setVpsList((prev) =>
-              prev.map((v) => (v.id === prb.vps_id ? { ...v, probes: [...v.probes, prb] } : v)),
+              prev.map((v) =>
+                v.id === prb.vps_id ? { ...v, probes: upsertById(v.probes, prb) } : v,
+              ),
             );
           }
           showToast(`Probe ${prb.name} created`);
