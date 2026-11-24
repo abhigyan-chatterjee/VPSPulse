@@ -314,4 +314,19 @@ func TestServerAuthHeartbeatAndInstallScript(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh syntax check failed: %v\n%s", err, string(out))
 	}
+
+	// 7. Verify /robots.txt and X-Robots-Tag anti-indexing headers.
+	rRobots, err := http.Get(ts.URL + "/robots.txt")
+	if err != nil || rRobots.StatusCode != http.StatusOK {
+		t.Fatalf("GET /robots.txt failed: %v", err)
+	}
+	var robotsBuf bytes.Buffer
+	_, _ = robotsBuf.ReadFrom(rRobots.Body)
+	_ = rRobots.Body.Close()
+	if !strings.Contains(robotsBuf.String(), "Disallow: /") {
+		t.Fatalf("unexpected /robots.txt body: %q", robotsBuf.String())
+	}
+	if xrt := rRobots.Header.Get("X-Robots-Tag"); !strings.Contains(xrt, "noindex") {
+		t.Fatalf("expected X-Robots-Tag noindex, got %q", xrt)
+	}
 }

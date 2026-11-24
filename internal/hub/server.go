@@ -44,13 +44,17 @@ func NewServer(cfg Config, st *store.Store, broker *Broker, prober *Prober, aler
 	return s
 }
 
-// Handler returns the root http.Handler.
+// Handler returns the root http.Handler wrapped with anti-indexing headers.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet, noimageindex")
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) registerRoutes() {
 	// Public routes
+	s.mux.HandleFunc("GET /robots.txt", s.handleRobotsTxt)
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/v1/auth/status", s.handleAuthStatus)
 	s.mux.HandleFunc("POST /api/v1/auth/setup", s.handleAuthSetup)
@@ -94,6 +98,11 @@ func (s *Server) registerRoutes() {
 
 	// Embedded SPA static files with index.html fallback
 	s.mux.HandleFunc("/", s.handleSPA)
+}
+
+func (s *Server) handleRobotsTxt(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("User-agent: *\nDisallow: /\n"))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
