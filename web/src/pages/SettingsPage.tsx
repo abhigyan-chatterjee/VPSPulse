@@ -14,11 +14,18 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
   // New channel form
   const [showAdd, setShowAdd] = useState(false);
   const [chName, setChName] = useState("");
-  const [chType, setChType] = useState<"discord" | "telegram" | "slack" | "webhook">("discord");
+  const [chType, setChType] = useState<"discord" | "telegram" | "slack" | "webhook" | "smtp">("discord");
   const [webhookUrl, setWebhookUrl] = useState("");
   const [botToken, setBotToken] = useState("");
   const [chatId, setChatId] = useState("");
   const [secret, setSecret] = useState("");
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState("587");
+  const [smtpTlsMode, setSmtpTlsMode] = useState("auto");
+  const [smtpFrom, setSmtpFrom] = useState("");
+  const [smtpTo, setSmtpTo] = useState("");
+  const [smtpUser, setSmtpUser] = useState("");
+  const [smtpPass, setSmtpPass] = useState("");
 
   // Password form
   const [curPass, setCurPass] = useState("");
@@ -39,9 +46,19 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
     const config: Record<string, string> =
       chType === "telegram"
         ? { bot_token: botToken, chat_id: chatId }
-        : chType === "webhook"
-          ? { url: webhookUrl, secret }
-          : { webhook_url: webhookUrl };
+        : chType === "smtp"
+          ? {
+              host: smtpHost,
+              port: smtpPort || "587",
+              tls_mode: smtpTlsMode,
+              from: smtpFrom,
+              to: smtpTo,
+              username: smtpUser,
+              password: smtpPass,
+            }
+          : chType === "webhook"
+            ? { url: webhookUrl, secret }
+            : { webhook_url: webhookUrl };
 
     try {
       await api.createChannel({
@@ -56,6 +73,13 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
       setBotToken("");
       setChatId("");
       setSecret("");
+      setSmtpHost("");
+      setSmtpPort("587");
+      setSmtpTlsMode("auto");
+      setSmtpFrom("");
+      setSmtpTo("");
+      setSmtpUser("");
+      setSmtpPass("");
       setShowAdd(false);
       await load();
       onToast("Notification channel added");
@@ -162,6 +186,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                 <option value="discord">Discord Webhook</option>
                 <option value="telegram">Telegram Bot</option>
                 <option value="slack">Slack Incoming Webhook</option>
+                <option value="smtp">SMTP Email Relay</option>
                 <option value="webhook">Generic JSON Webhook</option>
               </select>
             </div>
@@ -186,6 +211,86 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                   onChange={(e) => setChatId(e.target.value)}
                   className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
                 />
+              </div>
+            </div>
+          ) : chType === "smtp" ? (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-[var(--muted)] mb-1">SMTP Host</label>
+                  <input
+                    required
+                    value={smtpHost}
+                    onChange={(e) => setSmtpHost(e.target.value)}
+                    placeholder="smtp.resend.com"
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">Port</label>
+                  <input
+                    required
+                    value={smtpPort}
+                    onChange={(e) => setSmtpPort(e.target.value)}
+                    placeholder="587"
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">TLS Mode</label>
+                  <select
+                    value={smtpTlsMode}
+                    onChange={(e) => setSmtpTlsMode(e.target.value)}
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)]"
+                  >
+                    <option value="auto">Auto (465 TLS / 587 STARTTLS)</option>
+                    <option value="starttls">STARTTLS</option>
+                    <option value="tls">Implicit TLS (465)</option>
+                    <option value="none">Plain (No TLS)</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">From Email</label>
+                  <input
+                    required
+                    type="email"
+                    value={smtpFrom}
+                    onChange={(e) => setSmtpFrom(e.target.value)}
+                    placeholder="alerts@nullbit.in"
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">To Email(s) (comma-separated)</label>
+                  <input
+                    required
+                    value={smtpTo}
+                    onChange={(e) => setSmtpTo(e.target.value)}
+                    placeholder="abhi@nullbit.in"
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">Username (optional)</label>
+                  <input
+                    value={smtpUser}
+                    onChange={(e) => setSmtpUser(e.target.value)}
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[var(--muted)] mb-1">Password / API Key (optional)</label>
+                  <input
+                    type="password"
+                    value={smtpPass}
+                    onChange={(e) => setSmtpPass(e.target.value)}
+                    className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
+                  />
+                </div>
               </div>
             </div>
           ) : (
@@ -232,27 +337,37 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
       )}
 
       {/* Channel List */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {channels.map((ch) => (
-          <div key={ch.id} className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-4 space-y-3 text-xs">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="px-2 py-0.5 rounded font-mono uppercase bg-[var(--secondary)]">{ch.type}</span>
-                <span className="font-semibold">{ch.name}</span>
+      {channels.length === 0 && !showAdd ? (
+        <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--card)] p-8 text-center text-xs space-y-2">
+          <div className="font-medium text-[var(--fg)]">No alert channels configured yet</div>
+          <p className="text-[var(--muted)]">
+            Add Discord, Telegram, Slack, SMTP Email, or a custom Webhook to get notified when a VPS or service goes down.
+          </p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {channels.map((ch) => (
+            <div key={ch.id} className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-4 space-y-3 text-xs">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded font-mono uppercase bg-[var(--secondary)]">{ch.type}</span>
+                  <span className="font-semibold">{ch.name}</span>
+                </div>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={ch.enabled}
+                    onChange={() => handleToggleChannel(ch)}
+                    className="accent-[var(--primary)]"
+                  />
+                  <span>{ch.enabled ? "Enabled" : "Disabled"}</span>
+                </label>
               </div>
-              <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={ch.enabled}
-                  onChange={() => handleToggleChannel(ch)}
-                  className="accent-[var(--primary)]"
-                />
-                <span>{ch.enabled ? "Enabled" : "Disabled"}</span>
-              </label>
-            </div>
-            <div className="font-mono text-[var(--muted)] truncate">
-              {ch.config.webhook_url || ch.config.url || (ch.config.chat_id ? `chat_id: ${ch.config.chat_id}` : "")}
-            </div>
+              <div className="font-mono text-[var(--muted)] truncate">
+                {ch.type === "smtp"
+                  ? `smtp://${ch.config.host}:${ch.config.port || "587"} → ${ch.config.to}`
+                  : ch.config.webhook_url || ch.config.url || (ch.config.chat_id ? `chat_id: ${ch.config.chat_id}` : "")}
+              </div>
             <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
               <div className="flex items-center gap-1.5 flex-wrap">
                 {(["offline", "service", "resource", "tls"] as const).map((k) => (
@@ -288,7 +403,8 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
             </div>
           </div>
         ))}
-      </div>
+        </div>
+      )}
 
       {/* Storage & Password */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">

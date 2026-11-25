@@ -145,7 +145,7 @@ export interface Incident {
 export interface NotificationChannel {
   id: string;
   name: string;
-  type: "discord" | "telegram" | "slack" | "webhook" | string;
+  type: "discord" | "telegram" | "slack" | "webhook" | "smtp" | string;
   config: Record<string, string>;
   events: {
     offline: boolean;

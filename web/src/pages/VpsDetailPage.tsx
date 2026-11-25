@@ -661,6 +661,9 @@ export function VpsDetailPage({
                 >
                   Save Settings
                 </button>
+                <p className="text-[var(--muted)]">
+                  Alerts route to all enabled channels configured in Settings.
+                </p>
               </form>
 
               <div className="space-y-3 rounded-lg border border-[var(--border)] bg-[var(--bg)] p-4 flex flex-col justify-between">

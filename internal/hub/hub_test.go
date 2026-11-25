@@ -1,11 +1,14 @@
 package hub
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os/exec"
 	"strings"
 	"sync"
@@ -370,5 +373,110 @@ func TestServerAuthHeartbeatAndInstallScript(t *testing.T) {
 	}
 	if xrt := rRobots.Header.Get("X-Robots-Tag"); !strings.Contains(xrt, "noindex") {
 		t.Fatalf("expected X-Robots-Tag noindex, got %q", xrt)
+	}
+}
+
+func TestSMTPNotificationDelivery(t *testing.T) {
+	_, _, _, alerts, _ := newTestHub(t)
+
+	// Missing required fields should fail fast.
+	err := alerts.SendTest(context.Background(), store.NotificationChannel{
+		Name:   "broken-smtp",
+		Type:   "smtp",
+		Config: map[string]string{"host": "127.0.0.1"},
+	})
+	if err == nil {
+		t.Fatalf("expected error when from/to are missing")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	var mu sync.Mutex
+	var rcpts []string
+	var body string
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		tp := textproto.NewConn(conn)
+		_ = tp.PrintfLine("220 mock.smtp.local ESMTP")
+		r := bufio.NewReader(conn)
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			upper := strings.ToUpper(strings.TrimSpace(line))
+			switch {
+			case strings.HasPrefix(upper, "EHLO"), strings.HasPrefix(upper, "HELO"):
+				_ = tp.PrintfLine("250-mock.smtp.local")
+				_ = tp.PrintfLine("250 OK")
+			case strings.HasPrefix(upper, "MAIL FROM:"):
+				_ = tp.PrintfLine("250 OK")
+			case strings.HasPrefix(upper, "RCPT TO:"):
+				mu.Lock()
+				rcpts = append(rcpts, strings.TrimSpace(line))
+				mu.Unlock()
+				_ = tp.PrintfLine("250 OK")
+			case upper == "DATA":
+				_ = tp.PrintfLine("354 Start mail input")
+				var buf strings.Builder
+				for {
+					dline, err := r.ReadString('\n')
+					if err != nil || strings.TrimRight(dline, "\r\n") == "." {
+						break
+					}
+					buf.WriteString(dline)
+				}
+				mu.Lock()
+				body = buf.String()
+				mu.Unlock()
+				_ = tp.PrintfLine("250 Queued")
+			case upper == "QUIT":
+				_ = tp.PrintfLine("221 Bye")
+				return
+			default:
+				_ = tp.PrintfLine("250 OK")
+			}
+		}
+	}()
+
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	ch := store.NotificationChannel{
+		Name: "Email Alerts",
+		Type: "smtp",
+		Config: map[string]string{
+			"host":     host,
+			"port":     port,
+			"from":     "alerts@nullbit.in\r\nBcc: evil@example.com",
+			"to":       "abhi@nullbit.in, ops@nullbit.in",
+			"tls_mode": "none",
+		},
+		Enabled: true,
+	}
+	if err := alerts.SendTest(context.Background(), ch); err != nil {
+		t.Fatalf("SendTest SMTP failed: %v", err)
+	}
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rcpts) != 2 {
+		t.Fatalf("expected 2 RCPT TO recipients, got %v", rcpts)
+	}
+	if !strings.Contains(body, "Subject: [VPSPulse] [INFO] VPSPulse Test Alert") {
+		t.Fatalf("missing expected subject in email body:\n%s", body)
+	}
+	if strings.Contains(body, "\r\nBcc: evil@example.com") {
+		t.Fatalf("header injection was not sanitized:\n%s", body)
 	}
 }

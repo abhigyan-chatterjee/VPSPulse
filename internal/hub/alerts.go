@@ -377,6 +377,8 @@ func (a *AlertManager) sendToChannel(ctx context.Context, ch store.NotificationC
 	text := fmt.Sprintf("%s **[VPSPulse]** %s\n%s", prefix, title, detail)
 
 	switch ch.Type {
+	case "smtp":
+		return sendSMTP(ctx, ch, category, severity, title, detail)
 	case "discord":
 		endpoint = ch.Config["webhook_url"]
 		payload = map[string]any{
