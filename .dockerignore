@@ -1,0 +1,11 @@
+.git
+data
+bin
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+web/node_modules
+web/dist
+*.tsbuildinfo
