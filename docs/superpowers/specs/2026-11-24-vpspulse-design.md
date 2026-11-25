@@ -1,8 +1,7 @@
 # VPSPulse â€” VPS & Service Monitoring Dashboard Design
 
 **Date:** 2026-11-24  
-**Status:** Approved  
-**Target Directory:** `/home/abhi/.gemini/antigravity/scratch/vpspulse`
+**Status:** Approved
 
 ---
 
@@ -59,4 +58,4 @@ A small, self-hosted dashboard to monitor all VPSes and services from one placeâ
 - **`systemd` Units:** Reports explicitly watched units + any auto-detected `failed` units, plus discoverable `.service` unit names for UI autocomplete.
 - **External Probes:** HTTP/HTTPS (status range, optional keyword, latency, TLS expiry days), TCP, ICMP. Last 60 heartbeat ticks + `24h`/`7d`/`30d` uptime %.
 - **Offline & Retention:** Offline after `35s` silence. Raw `10s` metrics kept `24h`, `1m` rollups `7d`, `5m` rollups `30d`, raw probe ticks `7d`, hourly probe summaries `90d`, incidents `90d`.
-- **Alerting:** Global broadcast to enabled Discord/Telegram/Slack/Generic JSON channels with per-channel event toggles (`offline`, `service`, `resource`, `tls`) and state-transition hysteresis.
+- **Alerting:** Global broadcast to enabled Discord/Telegram/Slack/SMTP Email/Generic JSON channels with per-channel event toggles (`offline`, `service`, `resource`, `tls`) and state-transition hysteresis.
