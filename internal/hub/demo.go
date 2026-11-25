@@ -8,6 +8,7 @@ import (
 
 	"vpspulse/internal/protocol"
 	"vpspulse/internal/store"
+	"vpspulse/internal/version"
 )
 
 type demoNode struct {
@@ -190,16 +191,7 @@ func SeedAndStartDemo(ctx context.Context, st *store.Store, broker *Broker, aler
 					hb := buildDemoHeartbeat(nodes[i], t, float64(step))
 					if err := st.RecordHeartbeat(nodes[i].ID, hb); err == nil {
 						if updated, err := st.GetVPS(nodes[i].ID); err == nil && broker != nil {
-							containers, _ := st.ListContainers(updated.ID)
-							units, _ := st.ListSystemdUnits(updated.ID)
-							idCopy := updated.ID
-							probes, _ := st.ListProbes(&idCopy)
-							broker.Publish("vps_update", VPSView{
-								VPS:          *updated,
-								Containers:   containers,
-								SystemdUnits: units,
-								Probes:       probes,
-							})
+							broker.Publish("vps_update", BuildVPSView(st, *updated))
 						}
 					}
 				}
@@ -216,7 +208,7 @@ func buildDemoHeartbeat(n demoNode, ts time.Time, phase float64) protocol.Heartb
 	ramUsed := uint64(float64(n.RAMTotal) * math.Max(0.1, math.Min(0.95, n.RAMRatio+(rand.Float64()-0.5)*0.02)))
 	diskUsed := uint64(float64(n.DiskTotal) * n.DiskRatio)
 	return protocol.HeartbeatPayload{
-		AgentVersion: "0.4.2-demo",
+		AgentVersion: version.String() + "-demo",
 		Timestamp:    ts.UTC(),
 		Host: protocol.HostMeta{
 			Hostname:  n.Name,

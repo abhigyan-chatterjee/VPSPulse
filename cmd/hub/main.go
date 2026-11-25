@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"vpspulse/internal/hub"
 	"vpspulse/internal/store"
+	"vpspulse/internal/version"
 	"vpspulse/web"
 )
 
@@ -26,12 +28,18 @@ func main() {
 	listen := flag.String("listen", defaultListen, "HTTP listen address")
 	dbPath := flag.String("db", defaultDB, "SQLite database path")
 	publicURL := flag.String("public-url", defaultPublicURL, "Public hub URL for install scripts and links")
-	trustProxy := flag.Bool("trust-proxy", defaultTrustProxy, "Trust X-Forwarded-Proto from reverse proxy")
+	trustProxy := flag.Bool("trust-proxy", defaultTrustProxy, "Trust X-Forwarded-Proto/X-Forwarded-For from reverse proxy")
 	tlsCert := flag.String("tls-cert", os.Getenv("VPSP_TLS_CERT"), "Optional TLS certificate path")
 	tlsKey := flag.String("tls-key", os.Getenv("VPSP_TLS_KEY"), "Optional TLS key path")
 	downloadsDir := flag.String("downloads-dir", defaultDownloads, "Directory containing vpspulse-agent binaries")
 	demo := flag.Bool("demo", false, "Run in demo mode with simulated VPSes and temporary SQLite DB")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("vpspulse-hub", version.String())
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -76,7 +84,7 @@ func main() {
 		log.Fatalf("load embedded web assets: %v", err)
 	}
 
-	srv := hub.NewServer(hub.Config{
+	srv := hub.NewServer(ctx, hub.Config{
 		PublicURL:    *publicURL,
 		TrustProxy:   *trustProxy,
 		DownloadsDir: *downloadsDir,
@@ -90,16 +98,19 @@ func main() {
 		Addr:              *listen,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
 		<-ctx.Done()
+		broker.Close()
 		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shCtx)
 	}()
 
-	log.Printf("vpspulse-hub listening on %s (db=%s)", *listen, actualDB)
+	log.Printf("vpspulse-hub v%s listening on %s (db=%s)", version.String(), *listen, actualDB)
 	if *tlsCert != "" && *tlsKey != "" {
 		err = httpSrv.ListenAndServeTLS(*tlsCert, *tlsKey)
 	} else {

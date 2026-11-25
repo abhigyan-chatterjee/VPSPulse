@@ -3,9 +3,16 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+var validHostnameRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$`)
 
 // Probe defines an external health check managed by the central hub.
 type Probe struct {
@@ -34,6 +41,22 @@ type Probe struct {
 	Ticks            []ServiceTick `json:"ticks"`
 }
 
+// ProbePatch represents partial updates for PATCH /api/v1/probes/{id}.
+type ProbePatch struct {
+	VPSID            *string `json:"vps_id"`
+	Name             *string `json:"name"`
+	Type             *string `json:"type"`
+	Target           *string `json:"target"`
+	Method           *string `json:"method"`
+	ExpectedMin      *int    `json:"expected_min"`
+	ExpectedMax      *int    `json:"expected_max"`
+	Keyword          *string `json:"keyword"`
+	TimeoutSec       *int    `json:"timeout_sec"`
+	IntervalSec      *int    `json:"interval_sec"`
+	FailureThreshold *int    `json:"failure_threshold"`
+	Enabled          *bool   `json:"enabled"`
+}
+
 // ProbeCheckResult is a single execution result of a probe.
 type ProbeCheckResult struct {
 	Timestamp     int64  `json:"ts"`
@@ -44,16 +67,58 @@ type ProbeCheckResult struct {
 	ErrorMsg      string `json:"error_msg"`
 }
 
+// ValidateProbeTarget checks probe target format by probe type.
+func ValidateProbeTarget(typ, target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return errors.New("probe target is required")
+	}
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "http", "https":
+		u, err := url.Parse(target)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("http probe target must be a valid http:// or https:// URL")
+		}
+		return nil
+	case "tcp":
+		host, portStr, err := net.SplitHostPort(target)
+		if err != nil || host == "" {
+			return errors.New("tcp probe target must be host:port")
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 1 || port > 65535 {
+			return errors.New("tcp probe port must be between 1 and 65535")
+		}
+		return nil
+	case "icmp", "ping":
+		if strings.HasPrefix(target, "-") {
+			return errors.New("icmp target cannot start with '-'")
+		}
+		if net.ParseIP(target) != nil {
+			return nil
+		}
+		if !validHostnameRe.MatchString(target) {
+			return fmt.Errorf("invalid icmp hostname or IP %q", target)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported probe type %q", typ)
+	}
+}
+
 // CreateProbe inserts a new external probe.
 func (s *Store) CreateProbe(p Probe) (*Probe, error) {
 	p.Name = strings.TrimSpace(p.Name)
 	p.Target = strings.TrimSpace(p.Target)
 	p.Type = strings.ToLower(strings.TrimSpace(p.Type))
-	if p.Name == "" || p.Target == "" {
-		return nil, errors.New("probe name and target are required")
+	if p.Name == "" {
+		return nil, errors.New("probe name is required")
 	}
 	if p.Type == "" {
 		p.Type = "http"
+	}
+	if err := ValidateProbeTarget(p.Type, p.Target); err != nil {
+		return nil, err
 	}
 	if p.Method == "" {
 		p.Method = "GET"
@@ -66,9 +131,13 @@ func (s *Store) CreateProbe(p Probe) (*Probe, error) {
 	}
 	if p.TimeoutSec <= 0 {
 		p.TimeoutSec = 10
+	} else if p.TimeoutSec > 30 {
+		p.TimeoutSec = 30
 	}
 	if p.IntervalSec < 10 {
 		p.IntervalSec = 30
+	} else if p.IntervalSec > 3600 {
+		p.IntervalSec = 3600
 	}
 	if p.FailureThreshold <= 0 {
 		p.FailureThreshold = 2
@@ -152,6 +221,10 @@ func (s *Store) ListProbes(vpsIDFilter *string) ([]Probe, error) {
 		}
 		ids = append(ids, id)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
 	_ = rows.Close()
 
 	out := make([]Probe, 0, len(ids))
@@ -164,41 +237,58 @@ func (s *Store) ListProbes(vpsIDFilter *string) ([]Probe, error) {
 	return out, nil
 }
 
-// UpdateProbe updates mutable probe settings.
-func (s *Store) UpdateProbe(id string, p Probe) (*Probe, error) {
+// UpdateProbe applies a partial ProbePatch to an existing probe.
+func (s *Store) UpdateProbe(id string, p ProbePatch) (*Probe, error) {
 	cur, err := s.GetProbe(id)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(p.Name) != "" {
-		cur.Name = strings.TrimSpace(p.Name)
+	if p.Name != nil {
+		trimmed := strings.TrimSpace(*p.Name)
+		if trimmed == "" {
+			return nil, errors.New("probe name cannot be empty")
+		}
+		cur.Name = trimmed
 	}
-	if strings.TrimSpace(p.Target) != "" {
-		cur.Target = strings.TrimSpace(p.Target)
+	if p.Type != nil {
+		cur.Type = strings.ToLower(strings.TrimSpace(*p.Type))
 	}
-	if strings.TrimSpace(p.Type) != "" {
-		cur.Type = strings.ToLower(strings.TrimSpace(p.Type))
+	if p.Target != nil {
+		cur.Target = strings.TrimSpace(*p.Target)
 	}
-	if strings.TrimSpace(p.Method) != "" {
-		cur.Method = strings.ToUpper(strings.TrimSpace(p.Method))
+	if err := ValidateProbeTarget(cur.Type, cur.Target); err != nil {
+		return nil, err
 	}
-	if p.ExpectedMin > 0 {
-		cur.ExpectedMin = p.ExpectedMin
+	if p.Method != nil && strings.TrimSpace(*p.Method) != "" {
+		cur.Method = strings.ToUpper(strings.TrimSpace(*p.Method))
 	}
-	if p.ExpectedMax > 0 {
-		cur.ExpectedMax = p.ExpectedMax
+	if p.ExpectedMin != nil && *p.ExpectedMin > 0 {
+		cur.ExpectedMin = *p.ExpectedMin
 	}
-	cur.Keyword = p.Keyword
-	if p.TimeoutSec > 0 {
-		cur.TimeoutSec = p.TimeoutSec
+	if p.ExpectedMax != nil && *p.ExpectedMax > 0 {
+		cur.ExpectedMax = *p.ExpectedMax
 	}
-	if p.IntervalSec >= 10 {
-		cur.IntervalSec = p.IntervalSec
+	if p.Keyword != nil {
+		cur.Keyword = *p.Keyword
 	}
-	if p.FailureThreshold > 0 {
-		cur.FailureThreshold = p.FailureThreshold
+	if p.TimeoutSec != nil {
+		if *p.TimeoutSec < 1 || *p.TimeoutSec > 30 {
+			return nil, errors.New("timeout_sec must be between 1 and 30")
+		}
+		cur.TimeoutSec = *p.TimeoutSec
 	}
-	cur.Enabled = p.Enabled
+	if p.IntervalSec != nil {
+		if *p.IntervalSec < 10 || *p.IntervalSec > 3600 {
+			return nil, errors.New("interval_sec must be between 10 and 3600")
+		}
+		cur.IntervalSec = *p.IntervalSec
+	}
+	if p.FailureThreshold != nil && *p.FailureThreshold > 0 {
+		cur.FailureThreshold = *p.FailureThreshold
+	}
+	if p.Enabled != nil {
+		cur.Enabled = *p.Enabled
+	}
 	if p.VPSID != nil {
 		if *p.VPSID == "" {
 			cur.VPSID = nil
@@ -305,6 +395,9 @@ func (s *Store) GetProbeHistory(probeID string, limit int) ([]ServiceTick, float
 			return nil, 100, 100, 100, err
 		}
 		rev = append(rev, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 100, 100, 100, err
 	}
 	ticks := make([]ServiceTick, len(rev))
 	for i := range rev {

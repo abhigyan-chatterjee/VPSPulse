@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,11 +16,33 @@ import (
 	"vpspulse/internal/store"
 )
 
+// AlertConfig centralizes alerting and rollup intervals/thresholds.
+type AlertConfig struct {
+	MinOfflineAfter time.Duration
+	SustainWindow   time.Duration
+	HysteresisPct   float64
+	TLSWarnDays     int
+	MaxWorkers      int
+}
+
+// DefaultAlertConfig returns the standard alerting configuration.
+func DefaultAlertConfig() AlertConfig {
+	return AlertConfig{
+		MinOfflineAfter: 35 * time.Second,
+		SustainWindow:   180 * time.Second,
+		HysteresisPct:   5,
+		TLSWarnDays:     14,
+		MaxWorkers:      8,
+	}
+}
+
 // AlertManager evaluates VPS offline timeouts, service states, resource thresholds, and probe failures.
 type AlertManager struct {
 	store      *store.Store
 	broker     *Broker
 	httpClient *http.Client
+	cfg        AlertConfig
+	sem        chan struct{}
 
 	mu                 sync.Mutex
 	probeFailureCounts map[string]int
@@ -27,24 +50,47 @@ type AlertManager struct {
 	highRAMStart       map[string]int64
 }
 
-// NewAlertManager creates an AlertManager.
+// NewAlertManager creates an AlertManager with DefaultAlertConfig.
 func NewAlertManager(st *store.Store, broker *Broker) *AlertManager {
+	cfg := DefaultAlertConfig()
 	return &AlertManager{
 		store:              st,
 		broker:             broker,
 		httpClient:         &http.Client{Timeout: 8 * time.Second},
+		cfg:                cfg,
+		sem:                make(chan struct{}, cfg.MaxWorkers),
 		probeFailureCounts: map[string]int{},
 		highCPUStart:       map[string]int64{},
 		highRAMStart:       map[string]int64{},
 	}
 }
 
-// Start runs the periodic VPS offline detector and retention rollup loop.
+// ForgetVPS cleans up in-memory threshold trackers when a VPS is deleted.
+func (a *AlertManager) ForgetVPS(vpsID string) {
+	a.mu.Lock()
+	delete(a.highCPUStart, vpsID)
+	delete(a.highRAMStart, vpsID)
+	a.mu.Unlock()
+}
+
+// ForgetProbe cleans up in-memory failure counters when a probe is deleted or disabled.
+func (a *AlertManager) ForgetProbe(probeID string) {
+	a.mu.Lock()
+	delete(a.probeFailureCounts, probeID)
+	a.mu.Unlock()
+}
+
+// Start runs the periodic VPS offline detector, 5m rollup loop, and hourly retention pruning loop.
 func (a *AlertManager) Start(ctx context.Context) {
 	offlineTicker := time.NewTicker(10 * time.Second)
-	rollupTicker := time.NewTicker(1 * time.Hour)
+	rollupTicker := time.NewTicker(5 * time.Minute)
+	pruneTicker := time.NewTicker(1 * time.Hour)
 	defer offlineTicker.Stop()
 	defer rollupTicker.Stop()
+	defer pruneTicker.Stop()
+
+	policy := store.DefaultRetentionPolicy()
+	_ = a.store.RunRollups(time.Now(), policy)
 
 	for {
 		select {
@@ -53,24 +99,40 @@ func (a *AlertManager) Start(ctx context.Context) {
 		case <-offlineTicker.C:
 			a.CheckOfflineVPS(time.Now())
 		case <-rollupTicker.C:
-			_ = a.store.RunRollupsAndPrune(time.Now())
+			_ = a.store.RunRollups(time.Now(), policy)
+		case <-pruneTicker.C:
+			_ = a.store.PruneExpired(time.Now(), policy)
 		}
 	}
 }
 
-// CheckOfflineVPS marks VPSes offline when no heartbeat has arrived for >35s.
+func (a *AlertManager) offlineThresholdFor(v store.VPS) int64 {
+	interval := v.IntervalSeconds
+	if interval < 5 {
+		interval = 10
+	}
+	dyn := int64(interval*3 + 5)
+	minSec := int64(a.cfg.MinOfflineAfter.Seconds())
+	if dyn > minSec {
+		return dyn
+	}
+	return minSec
+}
+
+// CheckOfflineVPS marks VPSes offline when no heartbeat has arrived within their dynamic offline window.
 func (a *AlertManager) CheckOfflineVPS(now time.Time) {
 	list, err := a.store.ListVPS()
 	if err != nil {
 		return
 	}
-	cutoff := now.Unix() - 35
+	nowUnix := now.Unix()
 	for _, v := range list {
-		if v.Status == "online" && v.LastSeenAt > 0 && v.LastSeenAt < cutoff {
+		threshold := a.offlineThresholdFor(v)
+		if v.Status == "online" && v.LastSeenAt > 0 && nowUnix-v.LastSeenAt > threshold {
 			_ = a.store.SetVPSStatus(v.ID, "offline")
 			key := "vps-offline:" + v.ID
 			title := fmt.Sprintf("VPS %s is offline", v.Name)
-			detail := fmt.Sprintf("No heartbeat received from %s for >35 seconds.", v.Name)
+			detail := fmt.Sprintf("No heartbeat received from %s for >%d seconds.", v.Name, threshold)
 			inc, isNew, err := a.store.CreateOrUpdateIncident(key, "critical", &v.ID, title, detail)
 			if err == nil && isNew {
 				a.dispatch("offline", "critical", title, detail, &v.ID)
@@ -80,7 +142,7 @@ func (a *AlertManager) CheckOfflineVPS(now time.Time) {
 			}
 			if a.broker != nil {
 				if updated, err := a.store.GetVPS(v.ID); err == nil {
-					a.broker.Publish("vps_update", updated)
+					a.broker.Publish("vps_update", BuildVPSView(a.store, *updated))
 				}
 			}
 		}
@@ -175,13 +237,14 @@ func (a *AlertManager) EvaluateHeartbeat(vps store.VPS, payload protocol.Heartbe
 		}
 	}
 
-	// 4. Resource thresholds (sustained 3m for CPU/RAM, immediate for Disk).
-	a.evaluateSustainedThreshold(vps, "cpu", payload.Metrics.CPUPercent, vps.CPUWarn, 180, now, a.highCPUStart)
+	// 4. Resource thresholds (sustained SustainWindow for CPU/RAM, immediate for Disk).
+	sustainSec := int64(a.cfg.SustainWindow.Seconds())
+	a.evaluateSustainedThreshold(vps, "cpu", payload.Metrics.CPUPercent, vps.CPUWarn, sustainSec, now, a.highCPUStart)
 	var ramPct float64
 	if payload.Metrics.RAMTotalBytes > 0 {
 		ramPct = float64(payload.Metrics.RAMUsedBytes) * 100 / float64(payload.Metrics.RAMTotalBytes)
 	}
-	a.evaluateSustainedThreshold(vps, "ram", ramPct, vps.RAMWarn, 180, now, a.highRAMStart)
+	a.evaluateSustainedThreshold(vps, "ram", ramPct, vps.RAMWarn, sustainSec, now, a.highRAMStart)
 
 	var diskPct float64
 	if payload.Metrics.DiskTotalBytes > 0 {
@@ -225,12 +288,15 @@ func (a *AlertManager) evaluateSustainedThreshold(vps store.VPS, kind string, cu
 		return
 	}
 
-	if current < threshold-5 {
-		if tracker != nil {
-			a.mu.Lock()
-			delete(tracker, vps.ID)
-			a.mu.Unlock()
-		}
+	// Clear sustained breach timer whenever usage dips below threshold.
+	if tracker != nil {
+		a.mu.Lock()
+		delete(a.highCPUStart, vps.ID) // no-op if tracker is highRAMStart; delete on tracker below
+		delete(tracker, vps.ID)
+		a.mu.Unlock()
+	}
+
+	if current < threshold-a.cfg.HysteresisPct {
 		if inc, resolved, err := a.store.ResolveIncidentByKey(key, fmt.Sprintf("%s usage returned to %.1f%%", strings.ToUpper(kind), current)); err == nil && resolved {
 			a.dispatch("resource", "resolved", fmt.Sprintf("%s usage normalized on %s", strings.ToUpper(kind), vps.Name), inc.Detail, &vps.ID)
 			if a.broker != nil {
@@ -270,7 +336,7 @@ func isContainerAlerting(c store.DockerContainerView) (bool, string) {
 	return false, ""
 }
 
-// EvaluateProbe checks consecutive failures against FailureThreshold and TLS expiry < 14d.
+// EvaluateProbe checks consecutive failures against FailureThreshold and TLS expiry < TLSWarnDays.
 func (a *AlertManager) EvaluateProbe(probe store.Probe, res store.ProbeCheckResult) {
 	key := "probe-down:" + probe.ID
 	threshold := probe.FailureThreshold
@@ -278,13 +344,14 @@ func (a *AlertManager) EvaluateProbe(probe store.Probe, res store.ProbeCheckResu
 		threshold = 2
 	}
 
+	var fails int
 	a.mu.Lock()
 	if res.Status == "up" {
-		a.probeFailureCounts[probe.ID] = 0
+		delete(a.probeFailureCounts, probe.ID)
 	} else {
 		a.probeFailureCounts[probe.ID]++
+		fails = a.probeFailureCounts[probe.ID]
 	}
-	fails := a.probeFailureCounts[probe.ID]
 	a.mu.Unlock()
 
 	if res.Status == "up" {
@@ -308,7 +375,7 @@ func (a *AlertManager) EvaluateProbe(probe store.Probe, res store.ProbeCheckResu
 
 	if res.TLSExpiryDays != nil {
 		tlsKey := "probe-tls:" + probe.ID
-		if *res.TLSExpiryDays < 14 {
+		if *res.TLSExpiryDays < a.cfg.TLSWarnDays {
 			title := fmt.Sprintf("TLS certificate expiring soon for %s (%dd)", probe.Name, *res.TLSExpiryDays)
 			detail := fmt.Sprintf("Certificate for %s expires in %d days.", probe.Target, *res.TLSExpiryDays)
 			inc, isNew, err := a.store.CreateOrUpdateIncident(tlsKey, "warning", probe.VPSID, title, detail)
@@ -335,9 +402,17 @@ func (a *AlertManager) dispatch(category, severity, title, detail string, vpsID 
 		if !ch.Enabled || !channelWantsEvent(ch.Events, category) {
 			continue
 		}
-		go func(channel store.NotificationChannel) {
-			_ = a.sendToChannel(context.Background(), channel, category, severity, title, detail, vpsID)
-		}(ch)
+		select {
+		case a.sem <- struct{}{}:
+			go func(channel store.NotificationChannel) {
+				defer func() { <-a.sem }()
+				if err := a.sendToChannel(context.Background(), channel, category, severity, title, detail, vpsID); err != nil {
+					log.Printf("alert delivery failed for channel %q (%s): %v", channel.Name, channel.Type, err)
+				}
+			}(ch)
+		default:
+			log.Printf("alert dispatch queue full; dropping notification for %q", ch.Name)
+		}
 	}
 }
 
@@ -400,7 +475,7 @@ func (a *AlertManager) sendToChannel(ctx context.Context, ch store.NotificationC
 			"chat_id": chatID,
 			"text":    text,
 		}
-	default: // "webhook"
+	case "webhook":
 		endpoint = ch.Config["url"]
 		if endpoint == "" {
 			endpoint = ch.Config["webhook_url"]
@@ -417,6 +492,8 @@ func (a *AlertManager) sendToChannel(ctx context.Context, ch store.NotificationC
 			"vps_id":    vpsID,
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 		}
+	default:
+		return fmt.Errorf("unsupported channel type %q", ch.Type)
 	}
 
 	if endpoint == "" {
@@ -440,10 +517,12 @@ func (a *AlertManager) sendToChannel(ctx context.Context, ch store.NotificationC
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16*1024))
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("webhook returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

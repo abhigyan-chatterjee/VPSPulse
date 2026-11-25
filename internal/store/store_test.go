@@ -178,9 +178,12 @@ func TestRollupsAndRetentionPruning(t *testing.T) {
 		}
 	}
 
-	// Insert an old 1m (>7d), old 5m (>30d), and old incident (>90d).
+	// Insert an old 1m (>7d), retained 5m (-8d), old 5m (>30d), and old incident (>90d).
 	if err := s.InsertRollupSample("host_metrics_1m", v.ID, now.Add(-8*24*time.Hour).Unix(), 10, 10, 10, 10, 1, 1, 0.1); err != nil {
 		t.Fatalf("insert old 1m: %v", err)
+	}
+	if err := s.InsertRollupSample("host_metrics_5m", v.ID, now.Add(-8*24*time.Hour).Unix(), 10, 10, 10, 10, 1, 1, 0.1); err != nil {
+		t.Fatalf("insert retained 5m: %v", err)
 	}
 	if err := s.InsertRollupSample("host_metrics_5m", v.ID, now.Add(-31*24*time.Hour).Unix(), 10, 10, 10, 10, 1, 1, 0.1); err != nil {
 		t.Fatalf("insert old 5m: %v", err)
@@ -206,16 +209,16 @@ func TestRollupsAndRetentionPruning(t *testing.T) {
 	if rawCount != 2 {
 		t.Fatalf("expected 2 recent raw metrics after pruning >24h, got %d", rawCount)
 	}
-	if m1Count != 2 {
-		t.Fatalf("expected 2 recent 1m rollups (-25h and -10m, with -8d pruned), got %d", m1Count)
+	if m1Count != 1 {
+		t.Fatalf("expected 1 recent 1m rollup (-10m, with -8d pruned and -25h outside 24h raw window), got %d", m1Count)
 	}
 	var old1m int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM host_metrics_1m WHERE vps_id = ? AND bucket_ts < ?`, v.ID, now.Add(-7*24*time.Hour).Unix()).Scan(&old1m)
 	if old1m != 0 {
 		t.Fatalf("expected 0 1m rollups older than 7d, got %d", old1m)
 	}
-	if m5Count != 3 {
-		t.Fatalf("expected 3 recent 5m rollups (-8d, -25h, -10m; with -31d pruned), got %d", m5Count)
+	if m5Count != 2 {
+		t.Fatalf("expected 2 recent 5m rollups (-8d and -10m, with -31d pruned), got %d", m5Count)
 	}
 	var old5m int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM host_metrics_5m WHERE vps_id = ? AND bucket_ts < ?`, v.ID, now.Add(-30*24*time.Hour).Unix()).Scan(&old5m)

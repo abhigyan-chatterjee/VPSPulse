@@ -9,6 +9,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// dummyBcryptHash equalizes VerifyAdmin latency when a username does not exist.
+var dummyBcryptHash, _ = bcrypt.GenerateFromPassword([]byte("vpspulse-dummy-timing-guard"), bcrypt.DefaultCost)
+
 // User represents an admin account.
 type User struct {
 	ID           string `json:"id"`
@@ -19,7 +22,7 @@ type User struct {
 
 // Session represents an authenticated UI session.
 type Session struct {
-	Token     string `json:"token"`
+	Token     string `json:"-"`
 	UserID    string `json:"user_id"`
 	Username  string `json:"username"`
 	ExpiresAt int64  `json:"expires_at"`
@@ -34,11 +37,21 @@ func (s *Store) HasAdmin() (bool, error) {
 	return count > 0, nil
 }
 
+func validatePassword(password string) error {
+	if len(password) < 8 || len(password) > 72 {
+		return errors.New("password must be between 8 and 72 characters")
+	}
+	return nil
+}
+
 // CreateAdmin creates an admin user with a bcrypt-hashed password.
 func (s *Store) CreateAdmin(username, password string) (*User, error) {
 	username = strings.TrimSpace(username)
-	if username == "" || len(password) < 6 {
-		return nil, errors.New("username required and password must be at least 6 characters")
+	if username == "" {
+		return nil, errors.New("username is required")
+	}
+	if err := validatePassword(password); err != nil {
+		return nil, err
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -60,7 +73,56 @@ func (s *Store) CreateAdmin(username, password string) (*User, error) {
 	return u, nil
 }
 
-// VerifyAdmin verifies username and password and returns the matching user.
+// ErrAdminAlreadyExists is returned by CreateFirstAdmin when setup has already completed.
+var ErrAdminAlreadyExists = errors.New("admin account already exists")
+
+// CreateFirstAdmin atomically creates the initial admin user inside an immediate transaction.
+func (s *Store) CreateFirstAdmin(username, password string) (*User, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return nil, errors.New("username is required")
+	}
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, ErrAdminAlreadyExists
+	}
+
+	u := &User{
+		ID:           newID("usr"),
+		Username:     username,
+		PasswordHash: string(hash),
+		CreatedAt:    time.Now().Unix(),
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
+		u.ID, u.Username, u.PasswordHash, u.CreatedAt,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// VerifyAdmin verifies username and password in constant time and returns the matching user.
 func (s *Store) VerifyAdmin(username, password string) (*User, error) {
 	var u User
 	err := s.db.QueryRow(
@@ -69,6 +131,7 @@ func (s *Store) VerifyAdmin(username, password string) (*User, error) {
 	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
 			return nil, errors.New("invalid credentials")
 		}
 		return nil, err
@@ -81,8 +144,8 @@ func (s *Store) VerifyAdmin(username, password string) (*User, error) {
 
 // UpdatePassword updates an admin user's password hash.
 func (s *Store) UpdatePassword(userID, newPassword string) error {
-	if len(newPassword) < 6 {
-		return errors.New("password must be at least 6 characters")
+	if err := validatePassword(newPassword); err != nil {
+		return err
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
 	if err != nil {
@@ -132,6 +195,12 @@ func (s *Store) DeleteSession(rawToken string) error {
 		return nil
 	}
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE token = ?`, hashToken(rawToken))
+	return err
+}
+
+// DeleteUserSessions revokes all active sessions for a user (e.g. after password change).
+func (s *Store) DeleteUserSessions(userID string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
 	return err
 }
 

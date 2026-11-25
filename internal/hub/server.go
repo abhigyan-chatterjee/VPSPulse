@@ -3,12 +3,21 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
+	"log"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
+	"regexp"
 	"strings"
 
 	"vpspulse/internal/store"
+	"vpspulse/internal/version"
 )
+
+var validHostHeaderRe = regexp.MustCompile(`^[A-Za-z0-9.\-:\[\]]+$`)
 
 // Config holds runtime configuration for the hub HTTP server.
 type Config struct {
@@ -20,6 +29,7 @@ type Config struct {
 
 // Server wraps the HTTP router, store, SSE broker, prober, and alert manager.
 type Server struct {
+	ctx      context.Context
 	cfg      Config
 	store    *store.Store
 	broker   *Broker
@@ -27,11 +37,19 @@ type Server struct {
 	alerts   *AlertManager
 	staticFS fs.FS
 	mux      *http.ServeMux
+	limiter  *ipRateLimiter
 }
 
 // NewServer constructs a configured HTTP Server.
-func NewServer(cfg Config, st *store.Store, broker *Broker, prober *Prober, alerts *AlertManager, staticFS fs.FS) *Server {
+func NewServer(ctx context.Context, cfg Config, st *store.Store, broker *Broker, prober *Prober, alerts *AlertManager, staticFS fs.FS) *Server {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if broker != nil {
+		broker.SetStore(st)
+	}
 	s := &Server{
+		ctx:      ctx,
 		cfg:      cfg,
 		store:    st,
 		broker:   broker,
@@ -39,17 +57,47 @@ func NewServer(cfg Config, st *store.Store, broker *Broker, prober *Prober, aler
 		alerts:   alerts,
 		staticFS: staticFS,
 		mux:      http.NewServeMux(),
+		limiter:  newIPRateLimiter(5, 5), // 5 attempts/min + burst 5 per IP
 	}
 	s.registerRoutes()
 	return s
 }
 
-// Handler returns the root http.Handler wrapped with anti-indexing headers.
+// Handler returns the root http.Handler wrapped with security headers and CSRF origin protection.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet, noimageindex")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+
+		// Enforce same-origin checks on state-changing browser requests (exempting bearer-authed agent heartbeats).
+		if r.URL.Path != "/api/v1/agent/heartbeat" && isStateChangingMethod(r.Method) {
+			if !s.isSameOriginRequest(r) {
+				writeError(w, http.StatusForbidden, "cross-origin request blocked")
+				return
+			}
+		}
 		s.mux.ServeHTTP(w, r)
 	})
+}
+
+func isStateChangingMethod(m string) bool {
+	return m == http.MethodPost || m == http.MethodPut || m == http.MethodPatch || m == http.MethodDelete
+}
+
+func (s *Server) isSameOriginRequest(r *http.Request) bool {
+	if sfs := strings.ToLower(r.Header.Get("Sec-Fetch-Site")); sfs != "" {
+		return sfs == "same-origin" || sfs == "none"
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
+	}
+	return true
 }
 
 func (s *Server) registerRoutes() {
@@ -106,7 +154,11 @@ func (s *Server) handleRobotsTxt(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "demo_mode": s.cfg.DemoMode})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"demo_mode": s.cfg.DemoMode,
+		"version":   version.String(),
+	})
 }
 
 func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +178,6 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 		http.FileServer(http.FS(s.staticFS)).ServeHTTP(w, r)
 		return
 	}
-	// SPA client-side route fallback
 	indexBytes, err := fs.ReadFile(s.staticFS, "index.html")
 	if err != nil {
 		http.NotFound(w, r)
@@ -177,17 +228,70 @@ func (s *Server) isSecureRequest(r *http.Request) bool {
 
 func (s *Server) resolvePublicURL(r *http.Request) string {
 	if s.cfg.PublicURL != "" {
-		return strings.TrimRight(s.cfg.PublicURL, "/")
+		u, err := url.Parse(strings.TrimRight(s.cfg.PublicURL, "/"))
+		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && validHostHeaderRe.MatchString(u.Host) && u.User == nil {
+			return u.Scheme + "://" + u.Host + u.Path
+		}
+		return ""
 	}
 	scheme := "http"
 	if s.isSecureRequest(r) {
 		scheme = "https"
 	}
-	host := r.Host
+	host := strings.TrimSpace(r.Host)
 	if host == "" {
 		host = "localhost:8080"
 	}
+	if !validHostHeaderRe.MatchString(host) {
+		return ""
+	}
 	return scheme + "://" + host
+}
+
+// clientIP extracts the caller IP, trusting proxy headers only when TrustProxy is enabled.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); net.ParseIP(cf) != nil {
+			return cf
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			for _, part := range strings.Split(xff, ",") {
+				ip := strings.TrimSpace(part)
+				if net.ParseIP(ip) != nil {
+					return ip
+				}
+			}
+		}
+		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(xri) != nil {
+			return xri
+		}
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && net.ParseIP(host) != nil {
+		return host
+	}
+	if net.ParseIP(strings.TrimSpace(r.RemoteAddr)) != nil {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	return ""
+}
+
+// isPublicIP returns true only for globally routable unicast IPv4/IPv6 addresses.
+func isPublicIP(ipStr string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ipStr))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() || addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return false
+	}
+	// Reject CGNAT 100.64.0.0/10
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	if cgnat.Contains(addr) {
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -200,8 +304,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func decodeJSON(r *http.Request, dst any) error {
+func writeInternalError(w http.ResponseWriter, contextMsg string, err error) {
+	log.Printf("internal error (%s): %v", contextMsg, err)
+	writeError(w, http.StatusInternalServerError, "internal server error")
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) (int, error) {
+	if maxBytes <= 0 {
+		maxBytes = 64 << 10
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	defer func() { _ = r.Body.Close() }()
 	dec := json.NewDecoder(r.Body)
-	return dec.Decode(dst)
+	if err := dec.Decode(dst); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return http.StatusRequestEntityTooLarge, errors.New("request body too large")
+		}
+		return http.StatusBadRequest, errors.New("invalid json")
+	}
+	return 0, nil
 }

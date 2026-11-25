@@ -23,7 +23,7 @@ func Open(path string) (*Store, error) {
 	if path != ":memory:" {
 		dir := filepath.Dir(path)
 		if dir != "" && dir != "." {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return nil, fmt.Errorf("create db directory: %w", err)
 			}
 		}
@@ -34,6 +34,10 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+
+	if path != ":memory:" {
+		_ = os.Chmod(path, 0o600)
+	}
 
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL;",
@@ -252,6 +256,14 @@ func (s *Store) migrate() error {
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_incidents_key_status ON incidents(incident_key, status);`,
 		`CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at DESC);`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_open_key ON incidents(incident_key) WHERE status IN ('open', 'acknowledged');`,
+		`CREATE INDEX IF NOT EXISTS idx_host_metrics_raw_ts ON host_metrics_raw(ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_host_metrics_1m_ts ON host_metrics_1m(bucket_ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_host_metrics_5m_ts ON host_metrics_5m(bucket_ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_service_ticks_ts ON service_ticks(ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_probe_checks_ts ON probe_checks(ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_probe_hourly_ts ON probe_hourly_rollups(hour_ts);`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);`,
 	}
 
 	for _, stmt := range stmts {

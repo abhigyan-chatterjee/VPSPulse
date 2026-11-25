@@ -33,7 +33,7 @@ func newTestHub(t *testing.T) (*store.Store, *Broker, *Prober, *AlertManager, *S
 	staticFS := fstest.MapFS{
 		"index.html": &fstest.MapFile{Data: []byte("<html><body>VPSPulse</body></html>")},
 	}
-	srv := NewServer(Config{PublicURL: "https://monitor.example.com", TrustProxy: true}, st, broker, prober, alerts, staticFS)
+	srv := NewServer(context.Background(), Config{PublicURL: "https://monitor.example.com", TrustProxy: true}, st, broker, prober, alerts, staticFS)
 	return st, broker, prober, alerts, srv
 }
 
@@ -457,8 +457,8 @@ func TestSMTPNotificationDelivery(t *testing.T) {
 		Config: map[string]string{
 			"host":     host,
 			"port":     port,
-			"from":     "alerts@nullbit.in\r\nBcc: evil@example.com",
-			"to":       "abhi@nullbit.in, ops@nullbit.in",
+			"from":     "alerts@example.com\r\nBcc: evil@example.org",
+			"to":       "ops@example.com, oncall@example.com",
 			"tls_mode": "none",
 		},
 		Enabled: true,
@@ -476,7 +476,161 @@ func TestSMTPNotificationDelivery(t *testing.T) {
 	if !strings.Contains(body, "Subject: [VPSPulse] [INFO] VPSPulse Test Alert") {
 		t.Fatalf("missing expected subject in email body:\n%s", body)
 	}
-	if strings.Contains(body, "\r\nBcc: evil@example.com") {
+	if strings.Contains(body, "\r\nBcc: evil@example.org") {
 		t.Fatalf("header injection was not sanitized:\n%s", body)
+	}
+}
+
+func TestSecurityHardeningAndPublicIPResolution(t *testing.T) {
+	st, broker, prober, alerts, srv := newTestHub(t)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. ICMP flag injection must be rejected.
+	if _, err := st.CreateProbe(store.Probe{Name: "bad-icmp", Type: "icmp", Target: "-c 100 1.2.3.4", Enabled: true}); err == nil {
+		t.Fatalf("expected CreateProbe to reject ICMP target starting with '-'")
+	}
+
+	// 2. /downloads/vpspulse-hub must be 404 (allowlist only agent binaries).
+	rDL, err := http.Get(ts.URL + "/downloads/vpspulse-hub")
+	if err != nil {
+		t.Fatalf("GET /downloads/vpspulse-hub: %v", err)
+	}
+	_ = rDL.Body.Close()
+	if rDL.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for /downloads/vpspulse-hub, got %d", rDL.StatusCode)
+	}
+
+	// 3. /install.sh must reject malicious Host header when PublicURL is empty and use single quotes.
+	srvNoPub := NewServer(context.Background(), Config{TrustProxy: true}, st, broker, prober, alerts, fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html></html>")},
+	})
+	tsNoPub := httptest.NewServer(srvNoPub.Handler())
+	defer tsNoPub.Close()
+
+	badReq, _ := http.NewRequest(http.MethodGet, tsNoPub.URL+"/install.sh", nil)
+	badReq.Host = "evil.com$(id)"
+	rBadHost, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatalf("badHost req: %v", err)
+	}
+	_ = rBadHost.Body.Close()
+	if rBadHost.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malicious Host header on /install.sh, got %d", rBadHost.StatusCode)
+	}
+
+	rGoodInst, err := http.Get(ts.URL + "/install.sh")
+	if err != nil {
+		t.Fatalf("GET /install.sh: %v", err)
+	}
+	var instBuf bytes.Buffer
+	_, _ = instBuf.ReadFrom(rGoodInst.Body)
+	_ = rGoodInst.Body.Close()
+	if !strings.Contains(instBuf.String(), "HUB_URL='https://monitor.example.com'") {
+		t.Fatalf("expected single-quoted HUB_URL in /install.sh")
+	}
+
+	// 4. Setup admin, verify channel redaction & partial PATCH secret preservation, and password change session revocation.
+	client := &http.Client{Timeout: 5 * time.Second}
+	rSetup, err := client.Post(ts.URL+"/api/v1/auth/setup", "application/json", strings.NewReader(`{"username":"admin","password":"strongpassword"}`))
+	if err != nil || rSetup.StatusCode != http.StatusCreated {
+		t.Fatalf("setup failed: %v", err)
+	}
+	oldCookies := rSetup.Cookies()
+	_ = rSetup.Body.Close()
+
+	doAuthed := func(cookies []*http.Cookie, method, path, body string) *http.Response {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		r, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		return r
+	}
+
+	rCh := doAuthed(oldCookies, http.MethodPost, "/api/v1/channels", `{
+		"name":"Mail","type":"smtp",
+		"config":{"host":"smtp.example.com","port":"587","from":"a@example.com","to":"b@example.com","password":"super-secret-pw"},
+		"events":{"offline":true,"service":true,"resource":true,"tls":true},"enabled":true
+	}`)
+	var chResp store.NotificationChannel
+	_ = json.NewDecoder(rCh.Body).Decode(&chResp)
+	_ = rCh.Body.Close()
+	if chResp.Config["password"] != store.RedactedSentinel {
+		t.Fatalf("expected redacted SMTP password in response, got %q", chResp.Config["password"])
+	}
+
+	// Partial PATCH (toggling enabled=false) must preserve stored SMTP password.
+	rPatch := doAuthed(oldCookies, http.MethodPatch, "/api/v1/channels/"+chResp.ID, `{"enabled":false}`)
+	_ = rPatch.Body.Close()
+	storedCh, _ := st.GetChannel(chResp.ID)
+	if storedCh.Config["password"] != "super-secret-pw" {
+		t.Fatalf("expected stored SMTP password preserved after partial PATCH, got %q", storedCh.Config["password"])
+	}
+
+	// 5. Public IP resolution on agent heartbeat when host reports RFC1918 IP behind Cloudflare.
+	rVPS := doAuthed(oldCookies, http.MethodPost, "/api/v1/vps", `{"name":"oci-hyd","tag":"in"}`)
+	var vpsCreated struct {
+		VPS   VPSView `json:"vps"`
+		Token string  `json:"token"`
+	}
+	_ = json.NewDecoder(rVPS.Body).Decode(&vpsCreated)
+	_ = rVPS.Body.Close()
+
+	hbBytes, _ := json.Marshal(protocol.HeartbeatPayload{
+		Host:    protocol.HostMeta{Hostname: "oci-hyd", IP: "10.0.0.103", CPUCores: 2},
+		Metrics: protocol.HostMetrics{CPUPercent: 5, RAMUsedBytes: 100, RAMTotalBytes: 1000},
+	})
+	hbReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/agent/heartbeat", bytes.NewReader(hbBytes))
+	hbReq.Header.Set("Authorization", "Bearer "+vpsCreated.Token)
+	hbReq.Header.Set("CF-Connecting-IP", "198.51.100.42")
+	rHB, err := client.Do(hbReq)
+	if err != nil || rHB.StatusCode != http.StatusOK {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	_ = rHB.Body.Close()
+
+	gotVPS, _ := st.GetVPS(vpsCreated.VPS.ID)
+	if gotVPS.IP != "198.51.100.42" {
+		t.Fatalf("expected public IP 198.51.100.42 resolved from CF-Connecting-IP, got %q", gotVPS.IP)
+	}
+
+	// 6. Dynamic offline threshold: interval_seconds=60 should NOT mark VPS offline at 45s.
+	sixty := 60
+	_, _ = st.UpdateVPS(vpsCreated.VPS.ID, store.VPSPatch{IntervalSeconds: &sixty})
+	alerts.CheckOfflineVPS(time.Now().Add(45 * time.Second))
+	stillOnline, _ := st.GetVPS(vpsCreated.VPS.ID)
+	if stillOnline.Status != "online" {
+		t.Fatalf("expected VPS with 60s interval to remain online at 45s, got %s", stillOnline.Status)
+	}
+
+	// 7. Password change invalidates old session cookies.
+	rPass := doAuthed(oldCookies, http.MethodPost, "/api/v1/auth/password", `{"current_password":"strongpassword","new_password":"newstrongpassword"}`)
+	_ = rPass.Body.Close()
+	if rPass.StatusCode != http.StatusOK {
+		t.Fatalf("change password status %d", rPass.StatusCode)
+	}
+	rOldCheck := doAuthed(oldCookies, http.MethodGet, "/api/v1/vps", "")
+	_ = rOldCheck.Body.Close()
+	if rOldCheck.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected old session cookie invalidated after password change (401), got %d", rOldCheck.StatusCode)
+	}
+
+	// 8. Login rate limiting (burst 5 -> 6th fails with 429).
+	var got429 bool
+	for i := 0; i < 8; i++ {
+		rLog, _ := client.Post(ts.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"username":"admin","password":"wrongpassword"}`))
+		_ = rLog.Body.Close()
+		if rLog.StatusCode == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatalf("expected 429 Too Many Requests after rapid failed logins")
 	}
 }

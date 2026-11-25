@@ -4,9 +4,18 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
+
+// RedactedSentinel marks redacted secret values in API responses and incoming PATCH payloads.
+const RedactedSentinel = "__REDACTED__"
+
+var telegramBotTokenRe = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]{20,}$`)
 
 // ChannelEvents controls which alert categories are sent to a notification channel.
 type ChannelEvents struct {
@@ -20,11 +29,20 @@ type ChannelEvents struct {
 type NotificationChannel struct {
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
-	Type      string            `json:"type"` // "discord", "telegram", "slack", "webhook"
+	Type      string            `json:"type"` // "discord", "telegram", "slack", "smtp", "webhook"
 	Config    map[string]string `json:"config"`
 	Events    ChannelEvents     `json:"events"`
 	Enabled   bool              `json:"enabled"`
 	CreatedAt int64             `json:"created_at"`
+}
+
+// ChannelPatch represents partial updates for PATCH /api/v1/channels/{id}.
+type ChannelPatch struct {
+	Name    *string           `json:"name"`
+	Type    *string           `json:"type"`
+	Config  map[string]string `json:"config"`
+	Events  *ChannelEvents    `json:"events"`
+	Enabled *bool             `json:"enabled"`
 }
 
 // Incident records an outage, failure, threshold breach, or recovery event.
@@ -39,6 +57,46 @@ type Incident struct {
 	CreatedAt   int64   `json:"created_at"`
 	UpdatedAt   int64   `json:"updated_at"`
 	ResolvedAt  int64   `json:"resolved_at"`
+}
+
+// ValidateChannel validates notification channel type and endpoint fields.
+func ValidateChannel(typ string, cfg map[string]string) error {
+	switch typ {
+	case "discord", "slack":
+		raw := strings.TrimSpace(cfg["webhook_url"])
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("%s webhook_url must be a valid https:// URL", typ)
+		}
+		return nil
+	case "telegram":
+		tok := strings.TrimSpace(cfg["bot_token"])
+		chatID := strings.TrimSpace(cfg["chat_id"])
+		if !telegramBotTokenRe.MatchString(tok) {
+			return errors.New("invalid telegram bot_token format")
+		}
+		if chatID == "" {
+			return errors.New("telegram chat_id is required")
+		}
+		return nil
+	case "smtp":
+		if strings.TrimSpace(cfg["host"]) == "" || strings.TrimSpace(cfg["from"]) == "" || strings.TrimSpace(cfg["to"]) == "" {
+			return errors.New("smtp requires host, from, and to")
+		}
+		return nil
+	case "webhook":
+		raw := strings.TrimSpace(cfg["url"])
+		if raw == "" {
+			raw = strings.TrimSpace(cfg["webhook_url"])
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("webhook url must be a valid http:// or https:// URL")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported channel type %q", typ)
+	}
 }
 
 // ListChannels returns all configured notification channels.
@@ -64,7 +122,7 @@ func (s *Store) ListChannels() ([]NotificationChannel, error) {
 		ch.Enabled = enabled == 1
 		out = append(out, ch)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // GetChannel fetches a single notification channel by ID.
@@ -95,6 +153,12 @@ func (s *Store) CreateChannel(ch NotificationChannel) (*NotificationChannel, err
 	if ch.Name == "" || ch.Type == "" {
 		return nil, errors.New("channel name and type are required")
 	}
+	if ch.Config == nil {
+		ch.Config = map[string]string{}
+	}
+	if err := ValidateChannel(ch.Type, ch.Config); err != nil {
+		return nil, err
+	}
 	ch.ID = newID("chn")
 	ch.CreatedAt = time.Now().Unix()
 	cfgJSON, _ := json.Marshal(ch.Config)
@@ -114,23 +178,52 @@ func (s *Store) CreateChannel(ch NotificationChannel) (*NotificationChannel, err
 	return s.GetChannel(ch.ID)
 }
 
-// UpdateChannel modifies an existing notification channel.
-func (s *Store) UpdateChannel(id string, ch NotificationChannel) (*NotificationChannel, error) {
+func isSecretKey(k string) bool {
+	return k == "password" || k == "bot_token" || k == "secret" || k == "webhook_url" || k == "url"
+}
+
+// UpdateChannel applies a partial ChannelPatch, preserving redacted secrets when omitted or marked redacted.
+func (s *Store) UpdateChannel(id string, patch ChannelPatch) (*NotificationChannel, error) {
 	cur, err := s.GetChannel(id)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(ch.Name) != "" {
-		cur.Name = strings.TrimSpace(ch.Name)
+	prevType := cur.Type
+	if patch.Name != nil {
+		trimmed := strings.TrimSpace(*patch.Name)
+		if trimmed == "" {
+			return nil, errors.New("channel name cannot be empty")
+		}
+		cur.Name = trimmed
 	}
-	if strings.TrimSpace(ch.Type) != "" {
-		cur.Type = strings.ToLower(strings.TrimSpace(ch.Type))
+	if patch.Type != nil && strings.TrimSpace(*patch.Type) != "" {
+		cur.Type = strings.ToLower(strings.TrimSpace(*patch.Type))
 	}
-	if ch.Config != nil {
-		cur.Config = ch.Config
+	if patch.Config != nil {
+		merged := map[string]string{}
+		if cur.Type == prevType {
+			for k, v := range cur.Config {
+				merged[k] = v
+			}
+		}
+		for k, v := range patch.Config {
+			if isSecretKey(k) && (v == "" || v == RedactedSentinel || strings.Contains(v, "••••")) {
+				continue
+			}
+			merged[k] = v
+		}
+		cur.Config = merged
 	}
-	cur.Events = ch.Events
-	cur.Enabled = ch.Enabled
+	if err := ValidateChannel(cur.Type, cur.Config); err != nil {
+		return nil, err
+	}
+	if patch.Events != nil {
+		cur.Events = *patch.Events
+	}
+	if patch.Enabled != nil {
+		cur.Enabled = *patch.Enabled
+	}
+
 	cfgJSON, _ := json.Marshal(cur.Config)
 	evJSON, _ := json.Marshal(cur.Events)
 	enabled := 0
@@ -192,23 +285,31 @@ func (s *Store) ListIncidents(statusFilter string, limit int) ([]Incident, error
 		}
 		out = append(out, inc)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // CreateOrUpdateIncident creates an open incident if none exists for incidentKey, returning (inc, isNew, error).
 func (s *Store) CreateOrUpdateIncident(incidentKey, severity string, vpsID *string, title, detail string) (*Incident, bool, error) {
 	now := time.Now().Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var existingID string
-	err := s.db.QueryRow(
+	err = tx.QueryRow(
 		`SELECT id FROM incidents WHERE incident_key = ? AND status IN ('open', 'acknowledged') ORDER BY created_at DESC LIMIT 1`,
 		incidentKey,
 	).Scan(&existingID)
 	if err == nil {
-		_, err = s.db.Exec(
+		if _, err := tx.Exec(
 			`UPDATE incidents SET severity=?, title=?, detail=?, updated_at=? WHERE id=?`,
 			severity, title, detail, now, existingID,
-		)
-		if err != nil {
+		); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(); err != nil {
 			return nil, false, err
 		}
 		inc, err := s.getIncident(existingID)
@@ -223,12 +324,14 @@ func (s *Store) CreateOrUpdateIncident(incidentKey, severity string, vpsID *stri
 	if vpsID != nil && *vpsID != "" {
 		vpsArg = *vpsID
 	}
-	_, err = s.db.Exec(
+	if _, err := tx.Exec(
 		`INSERT INTO incidents (id, incident_key, vps_id, severity, title, detail, status, created_at, updated_at, resolved_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, 0)`,
 		id, incidentKey, vpsArg, severity, title, detail, now, now,
-	)
-	if err != nil {
+	); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
 	inc, err := s.getIncident(id)
@@ -237,8 +340,14 @@ func (s *Store) CreateOrUpdateIncident(incidentKey, severity string, vpsID *stri
 
 // ResolveIncidentByKey marks any open/acknowledged incident for incidentKey as resolved.
 func (s *Store) ResolveIncidentByKey(incidentKey, detail string) (*Incident, bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var existingID string
-	err := s.db.QueryRow(
+	err = tx.QueryRow(
 		`SELECT id FROM incidents WHERE incident_key = ? AND status IN ('open', 'acknowledged') ORDER BY created_at DESC LIMIT 1`,
 		incidentKey,
 	).Scan(&existingID)
@@ -249,11 +358,13 @@ func (s *Store) ResolveIncidentByKey(incidentKey, detail string) (*Incident, boo
 		return nil, false, err
 	}
 	now := time.Now().Unix()
-	_, err = s.db.Exec(
+	if _, err := tx.Exec(
 		`UPDATE incidents SET status = 'resolved', detail = ?, updated_at = ?, resolved_at = ? WHERE id = ?`,
 		detail, now, now, existingID,
-	)
-	if err != nil {
+	); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
 	inc, err := s.getIncident(existingID)
@@ -262,10 +373,11 @@ func (s *Store) ResolveIncidentByKey(incidentKey, detail string) (*Incident, boo
 
 // ResolveStaleIncidentsByPrefix resolves any open/acknowledged incidents whose key starts with prefix and is not in activeKeys.
 func (s *Store) ResolveStaleIncidentsByPrefix(prefix string, activeKeys map[string]bool, detail string) ([]Incident, error) {
+	runeLen := utf8.RuneCountInString(prefix)
 	rows, err := s.db.Query(
 		`SELECT id, incident_key FROM incidents
 		 WHERE status IN ('open', 'acknowledged') AND SUBSTR(incident_key, 1, ?) = ?`,
-		len(prefix), prefix,
+		runeLen, prefix,
 	)
 	if err != nil {
 		return nil, err
@@ -280,6 +392,10 @@ func (s *Store) ResolveStaleIncidentsByPrefix(prefix string, activeKeys map[stri
 		if !activeKeys[key] {
 			toResolve = append(toResolve, id)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
 	}
 	_ = rows.Close()
 
@@ -301,6 +417,54 @@ func (s *Store) ResolveStaleIncidentsByPrefix(prefix string, activeKeys map[stri
 		}
 	}
 	return resolved, nil
+}
+
+// ResolveIncidentsByVPS resolves all open/acknowledged incidents tied to vpsID before deletion.
+func (s *Store) ResolveIncidentsByVPS(vpsID, detail string) ([]Incident, error) {
+	rows, err := s.db.Query(
+		`SELECT id FROM incidents WHERE vps_id = ? AND status IN ('open', 'acknowledged')`,
+		vpsID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	_ = rows.Close()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	now := time.Now().Unix()
+	var resolved []Incident
+	for _, id := range ids {
+		if _, err := s.db.Exec(
+			`UPDATE incidents SET status = 'resolved', detail = ?, updated_at = ?, resolved_at = ? WHERE id = ?`,
+			detail, now, now, id,
+		); err == nil {
+			if inc, err := s.getIncident(id); err == nil {
+				resolved = append(resolved, *inc)
+			}
+		}
+	}
+	return resolved, nil
+}
+
+// ResolveIncidentsByProbe resolves open/acknowledged probe-down and probe-tls incidents for probeID.
+func (s *Store) ResolveIncidentsByProbe(probeID, detail string) ([]Incident, error) {
+	var out []Incident
+	for _, key := range []string{"probe-down:" + probeID, "probe-tls:" + probeID} {
+		if inc, ok, err := s.ResolveIncidentByKey(key, detail); err == nil && ok && inc != nil {
+			out = append(out, *inc)
+		}
+	}
+	return out, nil
 }
 
 // AcknowledgeIncident transitions an open incident to acknowledged.

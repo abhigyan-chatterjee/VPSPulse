@@ -4,11 +4,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"vpspulse/internal/protocol"
 )
+
+var validSystemdUnitRe = regexp.MustCompile(`^[A-Za-z0-9:_@.-]{1,256}$`)
 
 // VPS represents a monitored virtual private server.
 type VPS struct {
@@ -49,6 +55,18 @@ type VPSPatch struct {
 	IntervalSeconds *int     `json:"interval_seconds"`
 }
 
+func (s *Store) defaultThreshold(key string, fallback float64) float64 {
+	raw := strings.TrimSpace(s.GetSetting(key, ""))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 1 || v > 100 {
+		return fallback
+	}
+	return v
+}
+
 // CreateVPS registers a new VPS and returns it alongside its one-time raw agent token.
 func (s *Store) CreateVPS(name, tag string) (*VPS, string, error) {
 	name = strings.TrimSpace(name)
@@ -60,9 +78,14 @@ func (s *Store) CreateVPS(name, tag string) (*VPS, string, error) {
 	rawToken := randomToken("vpsp_", 24)
 	now := time.Now().Unix()
 
+	cpuWarn := s.defaultThreshold("default_cpu_warn", 90)
+	ramWarn := s.defaultThreshold("default_ram_warn", 90)
+	diskWarn := s.defaultThreshold("default_disk_warn", 85)
+
 	_, err := s.db.Exec(
-		`INSERT INTO vps (id, name, tag, token_hash, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)`,
-		id, name, tag, hashToken(rawToken), now,
+		`INSERT INTO vps (id, name, tag, token_hash, status, cpu_warn, ram_warn, disk_warn, created_at)
+		 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+		id, name, tag, hashToken(rawToken), cpuWarn, ramWarn, diskWarn, now,
 	)
 	if err != nil {
 		return nil, "", err
@@ -135,6 +158,10 @@ func (s *Store) ListVPS() ([]VPS, error) {
 		}
 		ids = append(ids, id)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
 	_ = rows.Close()
 
 	out := make([]VPS, 0, len(ids))
@@ -153,22 +180,38 @@ func (s *Store) UpdateVPS(id string, patch VPSPatch) (*VPS, error) {
 	if err != nil {
 		return nil, err
 	}
-	if patch.Name != nil && strings.TrimSpace(*patch.Name) != "" {
-		cur.Name = strings.TrimSpace(*patch.Name)
+	if patch.Name != nil {
+		trimmed := strings.TrimSpace(*patch.Name)
+		if trimmed == "" {
+			return nil, errors.New("vps name cannot be empty")
+		}
+		cur.Name = trimmed
 	}
 	if patch.Tag != nil {
 		cur.Tag = strings.TrimSpace(*patch.Tag)
 	}
 	if patch.CPUWarn != nil {
+		if *patch.CPUWarn < 1 || *patch.CPUWarn > 100 {
+			return nil, errors.New("cpu_warn must be between 1 and 100")
+		}
 		cur.CPUWarn = *patch.CPUWarn
 	}
 	if patch.RAMWarn != nil {
+		if *patch.RAMWarn < 1 || *patch.RAMWarn > 100 {
+			return nil, errors.New("ram_warn must be between 1 and 100")
+		}
 		cur.RAMWarn = *patch.RAMWarn
 	}
 	if patch.DiskWarn != nil {
+		if *patch.DiskWarn < 1 || *patch.DiskWarn > 100 {
+			return nil, errors.New("disk_warn must be between 1 and 100")
+		}
 		cur.DiskWarn = *patch.DiskWarn
 	}
-	if patch.IntervalSeconds != nil && *patch.IntervalSeconds >= 5 && *patch.IntervalSeconds <= 300 {
+	if patch.IntervalSeconds != nil {
+		if *patch.IntervalSeconds < 5 || *patch.IntervalSeconds > 300 {
+			return nil, errors.New("interval_seconds must be between 5 and 300")
+		}
 		cur.IntervalSeconds = *patch.IntervalSeconds
 	}
 	_, err = s.db.Exec(
@@ -227,8 +270,30 @@ func (s *Store) SetVPSStatus(id, status string) error {
 	return err
 }
 
+// ValidateUnitName validates a systemd unit name to prevent CLI flag injection.
+func ValidateUnitName(name string) error {
+	if name == "" || strings.HasPrefix(name, "-") || !validSystemdUnitRe.MatchString(name) {
+		return fmt.Errorf("invalid systemd unit name %q", name)
+	}
+	return nil
+}
+
 // SetWatchedUnits replaces the watched systemd unit list for a VPS.
 func (s *Store) SetWatchedUnits(vpsID string, units []string) error {
+	cleaned := make([]string, 0, len(units))
+	seen := map[string]bool{}
+	for _, u := range units {
+		u = strings.TrimSpace(u)
+		if u == "" || seen[u] {
+			continue
+		}
+		if err := ValidateUnitName(u); err != nil {
+			return err
+		}
+		seen[u] = true
+		cleaned = append(cleaned, u)
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -238,13 +303,7 @@ func (s *Store) SetWatchedUnits(vpsID string, units []string) error {
 	if _, err := tx.Exec(`DELETE FROM vps_watched_units WHERE vps_id = ?`, vpsID); err != nil {
 		return err
 	}
-	seen := map[string]bool{}
-	for _, u := range units {
-		u = strings.TrimSpace(u)
-		if u == "" || seen[u] {
-			continue
-		}
-		seen[u] = true
+	for _, u := range cleaned {
 		if _, err := tx.Exec(`INSERT INTO vps_watched_units (vps_id, unit_name) VALUES (?, ?)`, vpsID, u); err != nil {
 			return err
 		}
@@ -267,7 +326,7 @@ func (s *Store) GetWatchedUnits(vpsID string) ([]string, error) {
 		}
 		out = append(out, u)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // UpdateContainerPolicy updates muted/pinned flags for a container identified by (vpsID, containerName).
@@ -299,6 +358,13 @@ func (s *Store) UpdateContainerPolicy(vpsID, containerName string, muted, pinned
 		curMuted, curPinned, vpsID, containerName,
 	)
 	return err
+}
+
+func clampInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
 }
 
 // RecordHeartbeat persists a heartbeat payload from an agent and updates container/systemd history.
@@ -344,7 +410,7 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 		 WHERE id = ?`,
 		now,
 		payload.Host.Hostname, payload.Host.OS, payload.Host.Kernel, payload.Host.Arch, payload.Host.IP,
-		payload.Host.UptimeSec, payload.Host.CPUCores, payload.AgentVersion,
+		clampInt64(payload.Host.UptimeSec), payload.Host.CPUCores, payload.AgentVersion,
 		dockerAvail, systemdAvail,
 		string(discJSON), string(discJSON), string(discJSON),
 		string(disksJSON),
@@ -361,13 +427,12 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 			disk_used, disk_total, net_rx, net_tx
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		vpsID, now, m.CPUPercent, m.Load1, m.Load5, m.Load15,
-		m.RAMUsedBytes, m.RAMTotalBytes, m.SwapUsedBytes, m.SwapTotalBytes,
-		m.DiskUsedBytes, m.DiskTotalBytes, m.NetRxBytesPerSec, m.NetTxBytesPerSec,
+		clampInt64(m.RAMUsedBytes), clampInt64(m.RAMTotalBytes), clampInt64(m.SwapUsedBytes), clampInt64(m.SwapTotalBytes),
+		clampInt64(m.DiskUsedBytes), clampInt64(m.DiskTotalBytes), m.NetRxBytesPerSec, m.NetTxBytesPerSec,
 	); err != nil {
 		return err
 	}
 
-	// Upsert Docker containers keyed by (vps_id, name) to preserve policy & history across recreations.
 	reportedContainers := make(map[string]bool, len(payload.Containers))
 	for _, c := range payload.Containers {
 		reportedContainers[c.Name] = true
@@ -394,7 +459,7 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 				mem_limit = excluded.mem_limit,
 				updated_at = excluded.updated_at`,
 			vpsID, c.Name, c.ID, c.Image, c.State, c.Health, c.ExitCode, oom,
-			c.StartedAt, c.RestartCount, c.CPUPercent, c.MemUsedBytes, c.MemLimitBytes, now,
+			c.StartedAt, c.RestartCount, c.CPUPercent, clampInt64(c.MemUsedBytes), clampInt64(c.MemLimitBytes), now,
 		); err != nil {
 			return err
 		}
@@ -408,7 +473,6 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 		}
 	}
 
-	// Remove stale containers no longer present on the host unless pinned.
 	if payload.DockerAvailable {
 		rows, err := tx.Query(`SELECT name, pinned FROM vps_containers WHERE vps_id = ?`, vpsID)
 		if err != nil {
@@ -431,6 +495,10 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 				}
 			}
 		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
 		_ = rows.Close()
 		for _, cname := range toDelete {
 			if _, err := tx.Exec(`DELETE FROM vps_containers WHERE vps_id = ? AND name = ?`, vpsID, cname); err != nil {
@@ -447,7 +515,6 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 		}
 	}
 
-	// Upsert systemd units.
 	reportedUnits := make(map[string]bool, len(payload.SystemdUnits))
 	for _, u := range payload.SystemdUnits {
 		reportedUnits[u.Name] = true
@@ -465,7 +532,7 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 				active_since = excluded.active_since,
 				auto_failed = excluded.auto_failed,
 				updated_at = excluded.updated_at`,
-			vpsID, u.Name, u.ActiveState, u.SubState, u.MemBytes, u.ActiveSince, autoFailed, now,
+			vpsID, u.Name, u.ActiveState, u.SubState, clampInt64(u.MemBytes), u.ActiveSince, autoFailed, now,
 		); err != nil {
 			return err
 		}
@@ -498,6 +565,10 @@ func (s *Store) RecordHeartbeat(vpsID string, payload protocol.HeartbeatPayload)
 			if !reportedUnits[uname] {
 				staleUnits = append(staleUnits, uname)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
 		}
 		_ = rows.Close()
 		for _, uname := range staleUnits {

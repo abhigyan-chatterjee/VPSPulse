@@ -1,16 +1,76 @@
 package hub
 
 import (
+	"errors"
 	"net/http"
+	"sync"
 	"time"
+
+	"vpspulse/internal/store"
 )
 
 const sessionTTL = 7 * 24 * time.Hour
 
+type rateBucket struct {
+	tokens    float64
+	lastCheck time.Time
+}
+
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	rate    float64 // tokens per second
+	burst   float64
+	buckets map[string]*rateBucket
+}
+
+func newIPRateLimiter(perMinute, burst int) *ipRateLimiter {
+	return &ipRateLimiter{
+		rate:    float64(perMinute) / 60.0,
+		burst:   float64(burst),
+		buckets: map[string]*rateBucket{},
+	}
+}
+
+func (l *ipRateLimiter) Allow(ip string) bool {
+	if ip == "" {
+		ip = "unknown"
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if len(l.buckets) > 4096 {
+		cutoff := now.Add(-15 * time.Minute)
+		for k, b := range l.buckets {
+			if b.lastCheck.Before(cutoff) {
+				delete(l.buckets, k)
+			}
+		}
+	}
+
+	b, ok := l.buckets[ip]
+	if !ok {
+		b = &rateBucket{tokens: l.burst, lastCheck: now}
+		l.buckets[ip] = b
+	} else {
+		elapsed := now.Sub(b.lastCheck).Seconds()
+		b.tokens += elapsed * l.rate
+		if b.tokens > l.burst {
+			b.tokens = l.burst
+		}
+		b.lastCheck = now
+	}
+	if b.tokens < 1.0 {
+		return false
+	}
+	b.tokens -= 1.0
+	return true
+}
+
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	hasAdmin, err := s.store.HasAdmin()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, "auth status", err)
 		return
 	}
 	authenticated := false
@@ -31,31 +91,26 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
-	hasAdmin, err := s.store.HasAdmin()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if hasAdmin {
-		writeError(w, http.StatusConflict, "admin account already exists")
-		return
-	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if code, err := decodeJSON(w, r, &body, 16<<10); err != nil {
+		writeError(w, code, err.Error())
 		return
 	}
-	u, err := s.store.CreateAdmin(body.Username, body.Password)
+	u, err := s.store.CreateFirstAdmin(body.Username, body.Password)
 	if err != nil {
+		if errors.Is(err, store.ErrAdminAlreadyExists) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	tok, err := s.store.CreateSession(u.ID, sessionTTL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, "create session", err)
 		return
 	}
 	s.setSessionCookie(w, r, tok, int(sessionTTL.Seconds()))
@@ -63,12 +118,16 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.limiter.Allow(s.clientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, "too many login attempts, please wait a minute")
+		return
+	}
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if code, err := decodeJSON(w, r, &body, 16<<10); err != nil {
+		writeError(w, code, err.Error())
 		return
 	}
 	u, err := s.store.VerifyAdmin(body.Username, body.Password)
@@ -78,7 +137,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, err := s.store.CreateSession(u.ID, sessionTTL)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeInternalError(w, "create session", err)
 		return
 	}
 	s.setSessionCookie(w, r, tok, int(sessionTTL.Seconds()))
@@ -103,8 +162,8 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
 	}
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
+	if code, err := decodeJSON(w, r, &body, 16<<10); err != nil {
+		writeError(w, code, err.Error())
 		return
 	}
 	if _, err := s.store.VerifyAdmin(sess.Username, body.CurrentPassword); err != nil {
@@ -115,6 +174,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	_ = s.store.DeleteUserSessions(sess.UserID)
+	tok, err := s.store.CreateSession(sess.UserID, sessionTTL)
+	if err == nil {
+		s.setSessionCookie(w, r, tok, int(sessionTTL.Seconds()))
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -124,7 +188,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, val st
 		Value:    val,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		Secure:   s.isSecureRequest(r),
 		MaxAge:   maxAge,
 	})
