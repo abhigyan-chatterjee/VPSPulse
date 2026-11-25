@@ -10,6 +10,8 @@ interface SettingsPageProps {
 export function SettingsPage({ onToast }: SettingsPageProps) {
   const [channels, setChannels] = useState<NotificationChannel[]>([]);
   const [info, setInfo] = useState<SettingsInfo | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   // New channel form
   const [showAdd, setShowAdd] = useState(false);
@@ -26,19 +28,38 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
   const [smtpTo, setSmtpTo] = useState("");
   const [smtpUser, setSmtpUser] = useState("");
   const [smtpPass, setSmtpPass] = useState("");
+  const [savingCh, setSavingCh] = useState(false);
 
   // Password form
   const [curPass, setCurPass] = useState("");
   const [newPass, setNewPass] = useState("");
+  const [savingPass, setSavingPass] = useState(false);
 
   const load = async () => {
     const [ch, st] = await Promise.all([api.listChannels(), api.getSettings()]);
     setChannels(ch);
     setInfo(st);
+    setLoadErr(null);
   };
 
   useEffect(() => {
-    load().catch(() => {});
+    let cancelled = false;
+    Promise.all([api.listChannels(), api.getSettings()])
+      .then(([ch, st]) => {
+        if (!cancelled) {
+          setChannels(ch);
+          setInfo(st);
+          setLoadErr(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setLoadErr(err instanceof Error ? err.message : "Failed to load settings");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleCreateChannel = async (e: React.FormEvent) => {
@@ -60,6 +81,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
             ? { url: webhookUrl, secret }
             : { webhook_url: webhookUrl };
 
+    setSavingCh(true);
     try {
       await api.createChannel({
         name: chName,
@@ -85,15 +107,20 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
       onToast("Notification channel added");
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to create channel");
+    } finally {
+      setSavingCh(false);
     }
   };
 
   const handleToggleChannel = async (ch: NotificationChannel) => {
+    setBusyId(ch.id);
     try {
-      await api.updateChannel(ch.id, { ...ch, enabled: !ch.enabled });
+      await api.updateChannel(ch.id, { enabled: !ch.enabled });
       await load();
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to update channel");
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -101,45 +128,57 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
     ch: NotificationChannel,
     evKey: keyof NotificationChannel["events"],
   ) => {
+    setBusyId(ch.id);
     try {
       await api.updateChannel(ch.id, {
-        ...ch,
         events: { ...ch.events, [evKey]: !ch.events[evKey] },
       });
       await load();
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to update event toggle");
+    } finally {
+      setBusyId(null);
     }
   };
 
   const handleTest = async (ch: NotificationChannel) => {
+    setBusyId(ch.id);
     try {
       await api.testChannel(ch.id);
       onToast(`Test alert sent to ${ch.name}`);
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Test delivery failed");
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (ch: NotificationChannel) => {
+    if (!confirm(`Delete notification channel "${ch.name}"?`)) return;
+    setBusyId(ch.id);
     try {
-      await api.deleteChannel(id);
+      await api.deleteChannel(ch.id);
       await load();
       onToast("Channel deleted");
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to delete channel");
+    } finally {
+      setBusyId(null);
     }
   };
 
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSavingPass(true);
     try {
       await api.changePassword(curPass, newPass);
       setCurPass("");
       setNewPass("");
-      onToast("Password updated");
+      onToast("Password updated (other sessions signed out)");
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to update password");
+    } finally {
+      setSavingPass(false);
     }
   };
 
@@ -159,6 +198,12 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
           <Plus className="w-3.5 h-3.5" /> Add Channel
         </button>
       </div>
+
+      {loadErr && (
+        <div className="rounded-lg border border-[var(--error)]/40 bg-[var(--error)]/10 px-3.5 py-2 text-xs text-[var(--error)]">
+          {loadErr}
+        </div>
+      )}
 
       {showAdd && (
         <form
@@ -198,6 +243,8 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                 <label className="block text-[var(--muted)] mb-1">Bot Token</label>
                 <input
                   required
+                  type="password"
+                  autoComplete="new-password"
                   value={botToken}
                   onChange={(e) => setBotToken(e.target.value)}
                   className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
@@ -222,7 +269,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                     required
                     value={smtpHost}
                     onChange={(e) => setSmtpHost(e.target.value)}
-                    placeholder="smtp.resend.com"
+                    placeholder="smtp.example.com"
                     className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
                   />
                 </div>
@@ -230,6 +277,9 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                   <label className="block text-[var(--muted)] mb-1">Port</label>
                   <input
                     required
+                    type="number"
+                    min={1}
+                    max={65535}
                     value={smtpPort}
                     onChange={(e) => setSmtpPort(e.target.value)}
                     placeholder="587"
@@ -258,7 +308,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                     type="email"
                     value={smtpFrom}
                     onChange={(e) => setSmtpFrom(e.target.value)}
-                    placeholder="alerts@nullbit.in"
+                    placeholder="alerts@example.com"
                     className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
                   />
                 </div>
@@ -268,7 +318,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                     required
                     value={smtpTo}
                     onChange={(e) => setSmtpTo(e.target.value)}
-                    placeholder="abhi@nullbit.in"
+                    placeholder="ops@example.com"
                     className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
                   />
                 </div>
@@ -286,6 +336,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                   <label className="block text-[var(--muted)] mb-1">Password / API Key (optional)</label>
                   <input
                     type="password"
+                    autoComplete="new-password"
                     value={smtpPass}
                     onChange={(e) => setSmtpPass(e.target.value)}
                     className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
@@ -310,6 +361,8 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                 <div>
                   <label className="block text-[var(--muted)] mb-1">X-VPSPulse-Secret (optional)</label>
                   <input
+                    type="password"
+                    autoComplete="new-password"
                     value={secret}
                     onChange={(e) => setSecret(e.target.value)}
                     className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
@@ -327,10 +380,11 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
               Cancel
             </button>
             <button
+              disabled={savingCh}
               type="submit"
-              className="px-3.5 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium cursor-pointer"
+              className="px-3.5 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium disabled:opacity-50 cursor-pointer"
             >
-              Save Channel
+              {savingCh ? "Saving..." : "Save Channel"}
             </button>
           </div>
         </form>
@@ -355,6 +409,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                 </div>
                 <label className="inline-flex items-center gap-1.5 cursor-pointer">
                   <input
+                    disabled={busyId === ch.id}
                     type="checkbox"
                     checked={ch.enabled}
                     onChange={() => handleToggleChannel(ch)}
@@ -368,41 +423,44 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
                   ? `smtp://${ch.config.host}:${ch.config.port || "587"} → ${ch.config.to}`
                   : ch.config.webhook_url || ch.config.url || (ch.config.chat_id ? `chat_id: ${ch.config.chat_id}` : "")}
               </div>
-            <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
-              <div className="flex items-center gap-1.5 flex-wrap">
-                {(["offline", "service", "resource", "tls"] as const).map((k) => (
+              <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {(["offline", "service", "resource", "tls"] as const).map((k) => (
+                    <button
+                      key={k}
+                      disabled={busyId === ch.id}
+                      type="button"
+                      onClick={() => handleToggleEvent(ch, k)}
+                      className={`px-2 py-0.5 rounded border cursor-pointer disabled:opacity-50 ${
+                        ch.events[k]
+                          ? "border-[var(--primary)]/50 bg-[var(--bg)] text-[var(--fg)]"
+                          : "border-[var(--border)] text-[var(--muted)] opacity-50"
+                      }`}
+                    >
+                      {k}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-1.5">
                   <button
-                    key={k}
-                    type="button"
-                    onClick={() => handleToggleEvent(ch, k)}
-                    className={`px-2 py-0.5 rounded border cursor-pointer ${
-                      ch.events[k]
-                        ? "border-[var(--primary)]/50 bg-[var(--bg)] text-[var(--fg)]"
-                        : "border-[var(--border)] text-[var(--muted)] opacity-50"
-                    }`}
+                    disabled={busyId === ch.id}
+                    onClick={() => handleTest(ch)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[var(--secondary)] border border-[var(--border)] disabled:opacity-50 cursor-pointer"
                   >
-                    {k}
+                    <Send className="w-3 h-3" /> Test
                   </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => handleTest(ch)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[var(--secondary)] border border-[var(--border)] cursor-pointer"
-                >
-                  <Send className="w-3 h-3" /> Test
-                </button>
-                <button
-                  onClick={() => handleDelete(ch.id)}
-                  className="p-1.5 rounded border border-[var(--border)] text-[var(--error)] cursor-pointer"
-                  title="Delete channel"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
+                  <button
+                    disabled={busyId === ch.id}
+                    onClick={() => handleDelete(ch)}
+                    className="p-1.5 rounded border border-[var(--border)] text-[var(--error)] disabled:opacity-50 cursor-pointer"
+                    title="Delete channel"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
-        ))}
+          ))}
         </div>
       )}
 
@@ -426,6 +484,7 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
             <input
               required
               type="password"
+              autoComplete="current-password"
               value={curPass}
               onChange={(e) => setCurPass(e.target.value)}
               placeholder="Current password"
@@ -434,18 +493,20 @@ export function SettingsPage({ onToast }: SettingsPageProps) {
             <input
               required
               type="password"
-              minLength={6}
+              autoComplete="new-password"
+              minLength={8}
               value={newPass}
               onChange={(e) => setNewPass(e.target.value)}
-              placeholder="New password (6+ chars)"
+              placeholder="New password (8+ chars)"
               className="px-2.5 py-1.5 rounded bg-[var(--bg)] border border-[var(--border)]"
             />
           </div>
           <button
+            disabled={savingPass}
             type="submit"
-            className="px-3 py-1.5 rounded bg-[var(--secondary)] border border-[var(--border)] font-medium cursor-pointer"
+            className="px-3 py-1.5 rounded bg-[var(--secondary)] border border-[var(--border)] font-medium disabled:opacity-50 cursor-pointer"
           >
-            Update Password
+            {savingPass ? "Updating..." : "Update Password"}
           </button>
         </form>
       </div>

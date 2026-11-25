@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Check, Copy, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api, formatBytes, formatRelativeTime, formatUptime } from "../api/client";
+import { api, buildInstallCommand, copyText, formatBytes, formatRelativeTime, formatUptime } from "../api/client";
 import type { HostMetricPoint, VPS } from "../types";
 import { AreaChart } from "../components/AreaChart";
 import { HeartbeatBars } from "../components/HeartbeatBars";
-import { vpsHasIssue } from "../components/VpsCard";
+import { isContainerUnhealthy, probeStatusDot, vpsHasIssue } from "../components/VpsCard";
 
 interface VpsDetailPageProps {
   vps: VPS;
@@ -28,6 +28,7 @@ export function VpsDetailPage({
   const [range, setRange] = useState<"1h" | "24h" | "7d" | "30d">("24h");
   const [tab, setTab] = useState<"probes" | "docker" | "systemd" | "settings">("probes");
   const [metrics, setMetrics] = useState<HostMetricPoint[]>([]);
+  const [metricsErr, setMetricsErr] = useState<string | null>(null);
   const [unitChoice, setUnitChoice] = useState("");
   const [customUnit, setCustomUnit] = useState("");
 
@@ -39,39 +40,76 @@ export function VpsDetailPage({
   const [diskWarn, setDiskWarn] = useState(vps.disk_warn);
   const [rotatedToken, setRotatedToken] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+  const lastRollupFetchRef = useRef<number>(0);
 
   useEffect(() => {
-    setName(vps.name);
-    setTag(vps.tag);
-    setCpuWarn(vps.cpu_warn);
-    setRamWarn(vps.ram_warn);
-    setDiskWarn(vps.disk_warn);
-  }, [vps.id]);
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
+    if ((range === "7d" || range === "30d") && Date.now() - lastRollupFetchRef.current < 60_000 && metrics.length > 0) {
+      return;
+    }
     let cancelled = false;
     api
       .vpsMetrics(vps.id, range)
       .then((pts) => {
-        if (!cancelled) setMetrics(pts);
+        if (!cancelled) {
+          setMetrics(pts);
+          setMetricsErr(null);
+          lastRollupFetchRef.current = Date.now();
+        }
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (!cancelled) {
+          setMetrics([]);
+          setMetricsErr(err instanceof Error ? err.message : "Failed to load metrics");
+        }
+      });
     return () => {
       cancelled = true;
     };
   }, [vps.id, range, vps.last_seen_at]);
 
   const isOffline = vps.status === "offline";
+  const isPending = vps.status === "pending";
   const warn = vpsHasIssue(vps);
   const failedUnits = vps.systemd_units.filter((u) => u.active_state === "failed");
   const availableToAdd = vps.discoverable_units.filter((u) => !vps.watched_units.includes(u));
+  const effectiveUnitChoice = availableToAdd.includes(unitChoice) ? unitChoice : (availableToAdd[0] || "");
 
   const timestamps = metrics.map((m) => m.ts);
   const cpuSeries = metrics.map((m) => Number(m.cpu_percent.toFixed(1)));
   const ramSeries = metrics.map((m) => Number(m.ram_percent.toFixed(1)));
   const diskSeries = metrics.map((m) => Number(m.disk_percent.toFixed(1)));
-  const netRxSeries = metrics.map((m) => Number((m.net_rx / (1024 * 1024)).toFixed(2)));
-  const netTxSeries = metrics.map((m) => Number((m.net_tx / (1024 * 1024)).toFixed(2)));
+
+  // Auto-scale network throughput unit (B/s, KB/s, MB/s) so low-traffic hosts remain readable.
+  const { netUnit, netRxSeries, netTxSeries } = useMemo(() => {
+    const maxBytes = metrics.reduce((acc, m) => Math.max(acc, m.net_rx || 0, m.net_tx || 0), 0);
+    if (maxBytes >= 1024 * 1024) {
+      return {
+        netUnit: " MB/s",
+        netRxSeries: metrics.map((m) => Number(((m.net_rx || 0) / (1024 * 1024)).toFixed(2))),
+        netTxSeries: metrics.map((m) => Number(((m.net_tx || 0) / (1024 * 1024)).toFixed(2))),
+      };
+    }
+    if (maxBytes >= 1024) {
+      return {
+        netUnit: " KB/s",
+        netRxSeries: metrics.map((m) => Number(((m.net_rx || 0) / 1024).toFixed(1))),
+        netTxSeries: metrics.map((m) => Number(((m.net_tx || 0) / 1024).toFixed(1))),
+      };
+    }
+    return {
+      netUnit: " B/s",
+      netRxSeries: metrics.map((m) => Math.round(m.net_rx || 0)),
+      netTxSeries: metrics.map((m) => Math.round(m.net_tx || 0)),
+    };
+  }, [metrics]);
 
   const handleToggleContainer = async (containerName: string, patch: { muted?: boolean; pinned?: boolean }) => {
     try {
@@ -84,12 +122,13 @@ export function VpsDetailPage({
   };
 
   const handleAddWatchedUnit = async () => {
-    const unit = (customUnit.trim() || unitChoice || availableToAdd[0] || "").trim();
+    const unit = (customUnit.trim() || effectiveUnitChoice).trim();
     if (!unit) return;
     try {
       const next = Array.from(new Set([...vps.watched_units, unit]));
       const updated = await api.setWatchedUnits(vps.id, next);
       setCustomUnit("");
+      setUnitChoice("");
       onUpdated(updated);
       onToast(`Watching ${unit} (syncs on next heartbeat)`);
     } catch (err) {
@@ -119,7 +158,8 @@ export function VpsDetailPage({
     }
   };
 
-  const handleDeleteProbe = async (probeId: string) => {
+  const handleDeleteProbe = async (probeId: string, probeName: string) => {
+    if (!confirm(`Delete probe "${probeName}"?`)) return;
     try {
       await api.deleteProbe(probeId);
       const fresh = await api.getVPS(vps.id);
@@ -132,6 +172,7 @@ export function VpsDetailPage({
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
+    setBusy(true);
     try {
       const updated = await api.updateVPS(vps.id, {
         name,
@@ -144,33 +185,39 @@ export function VpsDetailPage({
       onToast("VPS settings saved");
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to save settings");
+    } finally {
+      setBusy(false);
     }
   };
 
   const handleRotateToken = async () => {
+    if (!confirm("Rotate agent token? The existing agent will stop authenticating until updated.")) return;
+    setBusy(true);
     try {
       const res = await api.rotateVPSToken(vps.id);
       setRotatedToken(res.token);
       onToast("Agent token rotated");
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to rotate token");
+    } finally {
+      setBusy(false);
     }
   };
 
   const handleDeleteVps = async () => {
     if (!confirm(`Delete ${vps.name} and all its stored metrics?`)) return;
+    setBusy(true);
     try {
       await api.deleteVPS(vps.id);
       onDeleted(vps.id);
     } catch (err) {
       onToast(err instanceof Error ? err.message : "Failed to delete VPS");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const baseUrl = publicUrl || window.location.origin;
-  const installSnippet = rotatedToken
-    ? `curl -fsSL ${baseUrl}/install.sh | sudo sh -s -- --url ${baseUrl} --token ${rotatedToken}`
-    : "";
+  const installSnippet = rotatedToken ? buildInstallCommand(publicUrl, rotatedToken) : "";
 
   return (
     <div className="space-y-5">
@@ -186,7 +233,13 @@ export function VpsDetailPage({
           <div className="flex items-center gap-2.5 flex-wrap">
             <span
               className={`h-3 w-3 rounded-full ${
-                isOffline ? "bg-[var(--error)]" : warn ? "bg-[var(--warning)]" : "bg-[var(--success)]"
+                isOffline
+                  ? "bg-[var(--error)]"
+                  : isPending
+                    ? "bg-[var(--muted)]"
+                    : warn
+                      ? "bg-[var(--warning)]"
+                      : "bg-[var(--success)]"
               }`}
             />
             <h1 className="text-lg font-semibold">{vps.name}</h1>
@@ -199,12 +252,14 @@ export function VpsDetailPage({
               className={`px-2 py-0.5 rounded-full text-xs font-medium ${
                 isOffline
                   ? "bg-[var(--error)]/15 text-[var(--error)]"
-                  : warn
-                    ? "bg-[var(--warning)]/15 text-[var(--warning)]"
-                    : "bg-[var(--success)]/15 text-[var(--success)]"
+                  : isPending
+                    ? "bg-[var(--secondary)] text-[var(--muted)]"
+                    : warn
+                      ? "bg-[var(--warning)]/15 text-[var(--warning)]"
+                      : "bg-[var(--success)]/15 text-[var(--success)]"
               }`}
             >
-              {isOffline ? "Offline" : warn ? "Attention needed" : "Healthy"}
+              {isOffline ? "Offline" : isPending ? "Waiting agent" : warn ? "Attention needed" : "Healthy"}
             </span>
           </div>
           <p className="text-xs text-[var(--muted)] font-mono">
@@ -218,7 +273,10 @@ export function VpsDetailPage({
           {(["1h", "24h", "7d", "30d"] as const).map((r) => (
             <button
               key={r}
-              onClick={() => setRange(r)}
+              onClick={() => {
+                lastRollupFetchRef.current = 0;
+                setRange(r);
+              }}
               className={`px-2.5 py-1 rounded text-xs font-mono cursor-pointer ${
                 range === r
                   ? "bg-[var(--primary)] text-[var(--primary-fg)] font-medium"
@@ -230,6 +288,12 @@ export function VpsDetailPage({
           ))}
         </div>
       </div>
+
+      {metricsErr && (
+        <div className="rounded-lg border border-[var(--error)]/40 bg-[var(--error)]/10 px-3.5 py-2 text-xs text-[var(--error)]">
+          {metricsErr}
+        </div>
+      )}
 
       {/* 4 Charts */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -253,7 +317,7 @@ export function VpsDetailPage({
         />
         <AreaChart
           title="Network Throughput"
-          unit=" MB/s"
+          unit={netUnit}
           seriesA={netRxSeries}
           seriesB={netTxSeries}
           labelA="RX"
@@ -276,28 +340,31 @@ export function VpsDetailPage({
       {/* Mounted Disks Strip */}
       {vps.disks.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {vps.disks.map((d) => (
-            <div key={d.mount} className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-3 text-xs space-y-1.5">
-              <div className="flex items-center justify-between font-mono">
-                <span className="font-semibold text-[var(--fg)] truncate">{d.mount}</span>
-                <span className="text-[var(--muted)]">{d.fs}</span>
+          {vps.disks.map((d) => {
+            const pct = Math.max(0, Math.min(100, Number(d.used_percent) || 0));
+            return (
+              <div key={d.mount} className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-3 text-xs space-y-1.5">
+                <div className="flex items-center justify-between font-mono">
+                  <span className="font-semibold text-[var(--fg)] truncate">{d.mount}</span>
+                  <span className="text-[var(--muted)]">{d.fs}</span>
+                </div>
+                <div className="h-1.5 rounded-full bg-[var(--secondary)] overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${
+                      pct >= vps.disk_warn ? "bg-[var(--error)]" : "bg-[var(--chart-6)]"
+                    }`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <div className="flex justify-between font-mono text-[var(--muted)]">
+                  <span>
+                    {formatBytes(d.used_bytes)} / {formatBytes(d.total_bytes)}
+                  </span>
+                  <span>{pct.toFixed(1)}%</span>
+                </div>
               </div>
-              <div className="h-1.5 rounded-full bg-[var(--secondary)] overflow-hidden">
-                <div
-                  className={`h-full rounded-full ${
-                    d.used_percent >= vps.disk_warn ? "bg-[var(--error)]" : "bg-[var(--chart-6)]"
-                  }`}
-                  style={{ width: `${Math.min(100, d.used_percent)}%` }}
-                />
-              </div>
-              <div className="flex justify-between font-mono text-[var(--muted)]">
-                <span>
-                  {formatBytes(d.used_bytes)} / {formatBytes(d.total_bytes)}
-                </span>
-                <span>{d.used_percent.toFixed(1)}%</span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -346,11 +413,7 @@ export function VpsDetailPage({
                   >
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span
-                          className={`h-2.5 w-2.5 rounded-full ${
-                            p.status === "down" ? "bg-[var(--error)]" : "bg-[var(--success)]"
-                          }`}
-                        />
+                        <span className={`h-2.5 w-2.5 rounded-full ${probeStatusDot(p)}`} />
                         <span className="text-xs font-semibold">{p.name}</span>
                         <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[var(--secondary)] text-[var(--muted)]">
                           {p.type.toUpperCase()}
@@ -369,7 +432,7 @@ export function VpsDetailPage({
                             TLS {p.tls_expiry_days}d left
                           </span>
                         )}
-                        <span>{p.latency_ms}ms</span>
+                        <span>{p.status === "pending" ? "—" : `${p.latency_ms}ms`}</span>
                         <span className="text-[var(--success)]">24h {p.uptime_24h.toFixed(2)}%</span>
                         <span className="text-[var(--muted)]">30d {p.uptime_30d.toFixed(2)}%</span>
                         <button
@@ -380,7 +443,7 @@ export function VpsDetailPage({
                           <Play className="w-3 h-3" />
                         </button>
                         <button
-                          onClick={() => handleDeleteProbe(p.id)}
+                          onClick={() => handleDeleteProbe(p.id, p.name)}
                           title="Delete probe"
                           className="p-1 rounded border border-[var(--border)] text-[var(--error)] hover:bg-[var(--error)]/10 cursor-pointer"
                         >
@@ -426,13 +489,8 @@ export function VpsDetailPage({
                     </thead>
                     <tbody className="divide-y divide-[var(--card-border)]">
                       {vps.containers.map((c) => {
-                        const bad =
-                          !c.muted &&
-                          (c.health === "unhealthy" ||
-                            c.state === "restarting" ||
-                            c.oom_killed ||
-                            (c.state === "exited" && c.exit_code !== 0));
-                        const cleanExit = c.state === "exited" && c.exit_code === 0;
+                        const bad = isContainerUnhealthy(c);
+                        const cleanExit = c.state === "exited" && c.exit_code === 0 && !c.pinned;
                         return (
                           <tr key={c.name} className={c.muted ? "opacity-55" : ""}>
                             <td className="py-2.5 pr-3">
@@ -518,7 +576,7 @@ export function VpsDetailPage({
                 <div className="flex items-center gap-2 flex-wrap">
                   {availableToAdd.length > 0 && (
                     <select
-                      value={unitChoice || availableToAdd[0]}
+                      value={effectiveUnitChoice}
                       onChange={(e) => setUnitChoice(e.target.value)}
                       className="px-2.5 py-1.5 rounded text-xs font-mono bg-[var(--bg)] border border-[var(--border)]"
                     >
@@ -612,6 +670,7 @@ export function VpsDetailPage({
                   <div>
                     <label className="block text-[var(--muted)] mb-1">Name</label>
                     <input
+                      required
                       value={name}
                       onChange={(e) => setName(e.target.value)}
                       className="w-full px-2.5 py-1.5 rounded bg-[var(--card)] border border-[var(--border)]"
@@ -630,7 +689,10 @@ export function VpsDetailPage({
                   <div>
                     <label className="block text-[var(--muted)] mb-1">CPU % (3m)</label>
                     <input
+                      required
                       type="number"
+                      min={1}
+                      max={100}
                       value={cpuWarn}
                       onChange={(e) => setCpuWarn(Number(e.target.value))}
                       className="w-full px-2.5 py-1.5 rounded bg-[var(--card)] border border-[var(--border)] font-mono"
@@ -639,7 +701,10 @@ export function VpsDetailPage({
                   <div>
                     <label className="block text-[var(--muted)] mb-1">RAM % (3m)</label>
                     <input
+                      required
                       type="number"
+                      min={1}
+                      max={100}
                       value={ramWarn}
                       onChange={(e) => setRamWarn(Number(e.target.value))}
                       className="w-full px-2.5 py-1.5 rounded bg-[var(--card)] border border-[var(--border)] font-mono"
@@ -648,7 +713,10 @@ export function VpsDetailPage({
                   <div>
                     <label className="block text-[var(--muted)] mb-1">Disk %</label>
                     <input
+                      required
                       type="number"
+                      min={1}
+                      max={100}
                       value={diskWarn}
                       onChange={(e) => setDiskWarn(Number(e.target.value))}
                       className="w-full px-2.5 py-1.5 rounded bg-[var(--card)] border border-[var(--border)] font-mono"
@@ -656,8 +724,9 @@ export function VpsDetailPage({
                   </div>
                 </div>
                 <button
+                  disabled={busy}
                   type="submit"
-                  className="px-3 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium cursor-pointer"
+                  className="px-3 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium disabled:opacity-50 cursor-pointer"
                 >
                   Save Settings
                 </button>
@@ -673,9 +742,10 @@ export function VpsDetailPage({
                     Rotating the token immediately revokes the previous token (401).
                   </p>
                   <button
+                    disabled={busy}
                     type="button"
                     onClick={handleRotateToken}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--secondary)] border border-[var(--border)] cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--secondary)] border border-[var(--border)] disabled:opacity-50 cursor-pointer"
                   >
                     <RefreshCw className="w-3.5 h-3.5" /> Rotate Agent Token
                   </button>
@@ -685,10 +755,16 @@ export function VpsDetailPage({
                       <pre className="font-mono whitespace-pre-wrap break-all select-all">{installSnippet}</pre>
                       <button
                         type="button"
-                        onClick={() => {
-                          navigator.clipboard.writeText(installSnippet).catch(() => {});
-                          setCopied(true);
-                          setTimeout(() => setCopied(false), 1800);
+                        onClick={async () => {
+                          const ok = await copyText(installSnippet);
+                          if (ok) {
+                            setCopied(true);
+                            onToast("Install command copied");
+                            if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+                            copyTimerRef.current = window.setTimeout(() => setCopied(false), 1800);
+                          } else {
+                            onToast("Copy failed — select and copy manually");
+                          }
                         }}
                         className="inline-flex items-center gap-1 text-[var(--primary)] cursor-pointer"
                       >
@@ -701,9 +777,10 @@ export function VpsDetailPage({
 
                 <div className="pt-3 border-t border-[var(--border)]">
                   <button
+                    disabled={busy}
                     type="button"
                     onClick={handleDeleteVps}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--error)]/15 text-[var(--error)] hover:bg-[var(--error)]/25 cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-[var(--error)]/15 text-[var(--error)] hover:bg-[var(--error)]/25 disabled:opacity-50 cursor-pointer"
                   >
                     <Trash2 className="w-3.5 h-3.5" /> Delete VPS
                   </button>

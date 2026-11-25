@@ -1,30 +1,46 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import { api } from "../api/client";
 import type { Probe } from "../types";
 
 interface AddProbeModalProps {
-  open: boolean;
   vpsId: string | null;
   onClose: () => void;
   onCreated: (probe: Probe) => void;
 }
 
-export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModalProps) {
+export function AddProbeModal({ vpsId, onClose, onCreated }: AddProbeModalProps) {
   const [name, setName] = useState("");
   const [type, setType] = useState<"http" | "tcp" | "icmp">("http");
   const [target, setTarget] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [intervalSec, setIntervalSec] = useState(30);
-  const [failureThreshold, setFailureThreshold] = useState(2);
+  const [intervalSec, setIntervalSec] = useState("30");
+  const [failureThreshold, setFailureThreshold] = useState("2");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
-  if (!open) return null;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    const interval = parseInt(intervalSec, 10);
+    const threshold = parseInt(failureThreshold, 10);
+    if (!Number.isFinite(interval) || interval < 10 || interval > 3600) {
+      setError("Check interval must be between 10 and 3600 seconds.");
+      return;
+    }
+    if (!Number.isFinite(threshold) || threshold < 1 || threshold > 20) {
+      setError("Failures before alert must be between 1 and 20.");
+      return;
+    }
+
     setBusy(true);
     try {
       const created = await api.createProbe({
@@ -32,14 +48,11 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
         name,
         type,
         target,
-        keyword,
-        interval_sec: Number(intervalSec),
-        failure_threshold: Number(failureThreshold),
+        keyword: type === "http" ? keyword : "",
+        interval_sec: interval,
+        failure_threshold: threshold,
         enabled: true,
       });
-      setName("");
-      setTarget("");
-      setKeyword("");
       onCreated(created);
       onClose();
     } catch (err) {
@@ -50,11 +63,23 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Add External Service Probe"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs"
+    >
       <div className="w-full max-w-md rounded-xl border border-[var(--border)] bg-[var(--card)] shadow-2xl overflow-hidden">
         <div className="px-5 py-4 border-b border-[var(--border)] flex items-center justify-between">
           <h2 className="text-sm font-semibold">Add External Service Probe</h2>
-          <button onClick={onClose} className="p-1 text-[var(--muted)] hover:text-[var(--fg)] cursor-pointer">
+          <button
+            onClick={onClose}
+            aria-label="Close modal"
+            className="p-1 text-[var(--muted)] hover:text-[var(--fg)] cursor-pointer"
+          >
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -66,7 +91,7 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
               required
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="api.myapp.dev"
+              placeholder="api.example.com"
               className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)]"
             />
           </div>
@@ -91,7 +116,13 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
                 required
                 value={target}
                 onChange={(e) => setTarget(e.target.value)}
-                placeholder={type === "http" ? "https://api.myapp.dev/health" : type === "tcp" ? "1.2.3.4:5432" : "1.2.3.4"}
+                placeholder={
+                  type === "http"
+                    ? "https://api.example.com/health"
+                    : type === "tcp"
+                      ? "198.51.100.10:5432"
+                      : "198.51.100.10"
+                }
                 className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
               />
             </div>
@@ -111,20 +142,24 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
             <div>
               <label className="block text-[var(--muted)] mb-1">Check Interval (sec)</label>
               <input
+                required
                 type="number"
                 min={10}
+                max={3600}
                 value={intervalSec}
-                onChange={(e) => setIntervalSec(Number(e.target.value))}
+                onChange={(e) => setIntervalSec(e.target.value)}
                 className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
               />
             </div>
             <div>
               <label className="block text-[var(--muted)] mb-1">Failures Before Alert</label>
               <input
+                required
                 type="number"
                 min={1}
+                max={20}
                 value={failureThreshold}
-                onChange={(e) => setFailureThreshold(Number(e.target.value))}
+                onChange={(e) => setFailureThreshold(e.target.value)}
                 className="w-full px-3 py-2 rounded bg-[var(--bg)] border border-[var(--border)] font-mono"
               />
             </div>
@@ -140,7 +175,7 @@ export function AddProbeModal({ open, vpsId, onClose, onCreated }: AddProbeModal
             <button
               disabled={busy}
               type="submit"
-              className="px-3.5 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium cursor-pointer"
+              className="px-3.5 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium disabled:opacity-50 cursor-pointer"
             >
               {busy ? "Creating..." : "Create Probe"}
             </button>

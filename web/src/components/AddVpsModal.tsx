@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Copy, X } from "lucide-react";
-import { api } from "../api/client";
+import { api, buildInstallCommand, copyText } from "../api/client";
 import type { VPS } from "../types";
 
 interface AddVpsModalProps {
@@ -18,13 +18,39 @@ export function AddVpsModal({ open, publicUrl, onClose, onCreated, onToast }: Ad
   const [error, setError] = useState("");
   const [createdToken, setCreatedToken] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  const resetAndClose = () => {
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = null;
+    }
+    setName("");
+    setTag("");
+    setCreatedToken(null);
+    setCopied(false);
+    setError("");
+    onClose();
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") resetAndClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   if (!open) return null;
 
-  const baseUrl = publicUrl || window.location.origin;
-  const installCmd = createdToken
-    ? `curl -fsSL ${baseUrl}/install.sh | sudo sh -s -- \\\n  --url ${baseUrl} --token ${createdToken}`
-    : "";
+  const installCmd = createdToken ? buildInstallCommand(publicUrl, createdToken) : "";
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -43,22 +69,27 @@ export function AddVpsModal({ open, publicUrl, onClose, onCreated, onToast }: Ad
 
   const handleCopy = async () => {
     if (!installCmd) return;
-    await navigator.clipboard.writeText(installCmd).catch(() => {});
-    setCopied(true);
-    onToast("Install command copied");
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  const resetAndClose = () => {
-    setName("");
-    setTag("");
-    setCreatedToken(null);
-    setError("");
-    onClose();
+    const ok = await copyText(installCmd);
+    if (ok) {
+      setCopied(true);
+      onToast("Install command copied");
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopied(false), 2000);
+    } else {
+      onToast("Copy failed — select and copy manually");
+    }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Connect a New VPS"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) resetAndClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs"
+    >
       <div className="w-full max-w-lg rounded-xl border border-[var(--border)] bg-[var(--card)] shadow-2xl overflow-hidden">
         <div className="px-5 py-4 border-b border-[var(--border)] flex items-center justify-between">
           <div>
@@ -69,6 +100,7 @@ export function AddVpsModal({ open, publicUrl, onClose, onCreated, onToast }: Ad
           </div>
           <button
             onClick={resetAndClose}
+            aria-label="Close modal"
             className="p-1.5 rounded-md text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--secondary)] cursor-pointer"
           >
             <X className="w-4 h-4" />

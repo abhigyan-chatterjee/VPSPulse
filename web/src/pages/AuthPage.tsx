@@ -4,11 +4,11 @@ import type { AuthStatus } from "../types";
 
 interface AuthPageProps {
   status: AuthStatus;
-  onSuccess: () => void;
+  onSuccess: () => Promise<void>;
 }
 
 export function AuthPage({ status, onSuccess }: AuthPageProps) {
-  const [username, setUsername] = useState(status.demo_mode ? "admin" : "admin");
+  const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -23,7 +23,7 @@ export function AuthPage({ status, onSuccess }: AuthPageProps) {
       } else {
         await api.login(username, password);
       }
-      onSuccess();
+      await onSuccess();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Authentication failed");
     } finally {
@@ -74,6 +74,7 @@ export function AuthPage({ status, onSuccess }: AuthPageProps) {
             <label className="block text-[var(--muted)] mb-1">Username</label>
             <input
               required
+              autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               className="w-full px-3 py-2 rounded-md bg-[var(--bg)] border border-[var(--border)] focus:outline-none focus:border-[var(--primary)]"
@@ -84,10 +85,11 @@ export function AuthPage({ status, onSuccess }: AuthPageProps) {
             <input
               required
               type="password"
-              minLength={6}
+              autoComplete={status.needs_setup ? "new-password" : "current-password"}
+              minLength={status.needs_setup ? 8 : undefined}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder={status.needs_setup ? "At least 6 characters" : "Enter password"}
+              placeholder={status.needs_setup ? "At least 8 characters" : "Enter password"}
               className="w-full px-3 py-2 rounded-md bg-[var(--bg)] border border-[var(--border)] focus:outline-none focus:border-[var(--primary)]"
             />
           </div>

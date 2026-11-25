@@ -38,7 +38,7 @@ export function Layout({
       >
         {label}
         {badge !== undefined && badge > 0 && (
-          <span className="px-1.5 py-0.2 rounded-full text-xs font-mono bg-[var(--warning)] text-[var(--primary-fg)]">
+          <span className="px-1.5 py-0.5 rounded-full text-xs font-mono bg-[var(--warning)] text-[var(--primary-fg)]">
             {badge}
           </span>
         )}

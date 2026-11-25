@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
-import { Plus, Search } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Play, Plus, Search, Trash2 } from "lucide-react";
+import { api } from "../api/client";
 import type { Incident, Probe, VPS } from "../types";
 import { HeartbeatBars } from "../components/HeartbeatBars";
-import { VpsCard, vpsHasIssue } from "../components/VpsCard";
+import { VpsCard, isContainerUnhealthy, probeStatusDot, vpsHasIssue } from "../components/VpsCard";
 
 interface OverviewPageProps {
   vpsList: VPS[];
@@ -11,6 +12,9 @@ interface OverviewPageProps {
   onSelectVps: (id: string) => void;
   onAddStandaloneProbe: () => void;
   onAddVps: () => void;
+  onProbeUpdated: (probe: Probe) => void;
+  onProbeDeleted: (id: string) => void;
+  onToast: (msg: string) => void;
 }
 
 export function OverviewPage({
@@ -20,14 +24,24 @@ export function OverviewPage({
   onSelectVps,
   onAddStandaloneProbe,
   onAddVps,
+  onProbeUpdated,
+  onProbeDeleted,
+  onToast,
 }: OverviewPageProps) {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
+  const [busyProbeId, setBusyProbeId] = useState<string | null>(null);
 
   const tags = useMemo(
     () => Array.from(new Set(vpsList.map((v) => v.tag).filter(Boolean))),
     [vpsList],
   );
+
+  useEffect(() => {
+    if (filter !== "all" && filter !== "issues" && !tags.includes(filter)) {
+      setFilter("all");
+    }
+  }, [filter, tags]);
 
   const onlineCount = vpsList.filter((v) => v.status === "online").length;
   const issueVpsCount = vpsList.filter(vpsHasIssue).length;
@@ -47,13 +61,7 @@ export function OverviewPage({
       for (const c of v.containers) {
         if (c.muted) continue;
         total++;
-        const bad =
-          c.health === "unhealthy" ||
-          c.state === "restarting" ||
-          c.oom_killed ||
-          (c.state === "exited" && c.exit_code !== 0) ||
-          (c.pinned && c.state !== "running");
-        if (bad) down++;
+        if (isContainerUnhealthy(c)) down++;
         uptimes.push(c.uptime_24h);
       }
       for (const u of v.systemd_units) {
@@ -62,7 +70,7 @@ export function OverviewPage({
         uptimes.push(u.uptime_24h);
       }
     }
-    const avg = uptimes.length > 0 ? uptimes.reduce((a, b) => a + b, 0) / uptimes.length : 100;
+    const avg = uptimes.length > 0 ? uptimes.reduce((a, b) => a + b, 0) / uptimes.length : null;
     return { totalServices: total, upServices: total - down, avgUptime: avg };
   }, [vpsList, standaloneProbes]);
 
@@ -86,6 +94,33 @@ export function OverviewPage({
     });
   }, [vpsList, search, filter]);
 
+  const handleCheckStandalone = async (probe: Probe) => {
+    setBusyProbeId(probe.id);
+    try {
+      const res = await api.checkProbeNow(probe.id);
+      if (res.probe) onProbeUpdated(res.probe);
+      onToast(`Checked ${probe.name}`);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : "Probe check failed");
+    } finally {
+      setBusyProbeId(null);
+    }
+  };
+
+  const handleDeleteStandalone = async (probe: Probe) => {
+    if (!confirm(`Delete external probe "${probe.name}"?`)) return;
+    setBusyProbeId(probe.id);
+    try {
+      await api.deleteProbe(probe.id);
+      onProbeDeleted(probe.id);
+      onToast(`Deleted probe ${probe.name}`);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : "Failed to delete probe");
+    } finally {
+      setBusyProbeId(null);
+    }
+  };
+
   return (
     <div className="space-y-5">
       {/* KPI Strip */}
@@ -95,7 +130,11 @@ export function OverviewPage({
             <span className="text-xs text-[var(--muted)]">VPSes Online</span>
             <span
               className={`h-2 w-2 rounded-full ${
-                onlineCount === vpsList.length ? "bg-[var(--success)]" : "bg-[var(--warning)]"
+                vpsList.length === 0
+                  ? "bg-[var(--muted)]"
+                  : onlineCount === vpsList.length
+                    ? "bg-[var(--success)]"
+                    : "bg-[var(--warning)]"
               }`}
             />
           </div>
@@ -112,7 +151,15 @@ export function OverviewPage({
         <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
           <div className="flex items-center justify-between">
             <span className="text-xs text-[var(--muted)]">Services Healthy</span>
-            <span className="h-2 w-2 rounded-full bg-[var(--success)]" />
+            <span
+              className={`h-2 w-2 rounded-full ${
+                totalServices === 0
+                  ? "bg-[var(--muted)]"
+                  : upServices === totalServices
+                    ? "bg-[var(--success)]"
+                    : "bg-[var(--warning)]"
+              }`}
+            />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-xl font-semibold tabular-nums">
@@ -142,10 +189,12 @@ export function OverviewPage({
         <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4">
           <div className="flex items-center justify-between">
             <span className="text-xs text-[var(--muted)]">Avg Uptime</span>
-            <span className="text-xs font-mono text-[var(--muted)]">30d</span>
+            <span className="text-xs font-mono text-[var(--muted)]">24h / 30d</span>
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className="text-xl font-semibold tabular-nums">{avgUptime.toFixed(2)}%</span>
+            <span className="text-xl font-semibold tabular-nums">
+              {avgUptime !== null ? `${avgUptime.toFixed(2)}%` : "—"}
+            </span>
             <span className="text-xs text-[var(--muted)]">across all checks</span>
           </div>
         </div>
@@ -230,11 +279,9 @@ export function OverviewPage({
       {/* Standalone External Services */}
       <div className="rounded-xl border border-[var(--border)] bg-[var(--card)] p-4">
         <div className="flex items-center justify-between mb-3">
-          <div>
-            <span className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
-              External Services (Standalone Probes)
-            </span>
-          </div>
+          <span className="text-xs font-semibold uppercase tracking-wider text-[var(--muted)]">
+            External Services (Standalone Probes)
+          </span>
           <button
             onClick={onAddStandaloneProbe}
             className="inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-medium bg-[var(--secondary)] border border-[var(--border)] hover:opacity-90 cursor-pointer"
@@ -249,25 +296,47 @@ export function OverviewPage({
             {standaloneProbes.map((p) => (
               <div
                 key={p.id}
-                className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-[var(--bg)] border border-[var(--border)]"
+                title={p.last_error || p.target}
+                className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[var(--bg)] border border-[var(--border)]"
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  <span
-                    className={`h-2 w-2 rounded-full shrink-0 ${
-                      p.status === "down" ? "bg-[var(--error)]" : "bg-[var(--success)]"
-                    }`}
-                  />
+                  <span className={`h-2 w-2 rounded-full shrink-0 ${probeStatusDot(p)}`} />
                   <span className="text-xs font-medium truncate">{p.name}</span>
-                  <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[var(--secondary)] text-[var(--muted)]">
+                  <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[var(--secondary)] text-[var(--muted)] shrink-0">
                     {p.type.toUpperCase()}
                   </span>
+                  {p.tls_expiry_days !== null && p.tls_expiry_days < 14 && (
+                    <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[var(--warning)]/15 text-[var(--warning)] shrink-0">
+                      TLS {p.tls_expiry_days}d
+                    </span>
+                  )}
                 </div>
-                <div className="flex items-center gap-3 shrink-0">
-                  <span className="text-xs font-mono tabular-nums text-[var(--muted)]">{p.latency_ms}ms</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs font-mono tabular-nums text-[var(--muted)]">
+                    {p.status === "pending" ? "—" : `${p.latency_ms}ms`}
+                  </span>
                   <span className="text-xs font-mono tabular-nums text-[var(--success)]">
                     {p.uptime_30d.toFixed(2)}%
                   </span>
-                  <HeartbeatBars ticks={p.ticks} count={18} />
+                  <div className="hidden sm:block">
+                    <HeartbeatBars ticks={p.ticks} count={14} />
+                  </div>
+                  <button
+                    disabled={busyProbeId === p.id}
+                    onClick={() => handleCheckStandalone(p)}
+                    title="Run check now"
+                    className="p-1 rounded border border-[var(--border)] hover:bg-[var(--secondary)] disabled:opacity-50 cursor-pointer"
+                  >
+                    <Play className="w-3 h-3" />
+                  </button>
+                  <button
+                    disabled={busyProbeId === p.id}
+                    onClick={() => handleDeleteStandalone(p)}
+                    title="Delete probe"
+                    className="p-1 rounded border border-[var(--border)] text-[var(--error)] hover:bg-[var(--error)]/10 disabled:opacity-50 cursor-pointer"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
                 </div>
               </div>
             ))}

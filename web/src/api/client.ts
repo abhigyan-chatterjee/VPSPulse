@@ -8,19 +8,55 @@ import type {
   VPS,
 } from "../types";
 
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  unauthorizedHandler = fn;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (init?.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(path, {
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
     ...init,
+    headers: {
+      ...headers,
+      ...(init?.headers as Record<string, string> | undefined),
+    },
   });
+
   const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: Record<string, unknown> = {};
+  if (text) {
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+  }
+
+  if (res.status === 401 && path !== "/api/v1/auth/login" && path !== "/api/v1/auth/password") {
+    unauthorizedHandler?.();
+  }
+
   if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    const msg =
+      typeof data.error === "string" && data.error
+        ? data.error
+        : `Request failed (${res.status}${res.statusText ? " " + res.statusText : ""})`;
+    throw new ApiError(res.status, msg);
   }
   return data as T;
 }
@@ -124,8 +160,50 @@ export const api = {
     req<SettingsInfo>("/api/v1/settings", { method: "PATCH", body: JSON.stringify(patch) }),
 };
 
+export async function copyText(text: string): Promise<boolean> {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to textarea fallback
+    }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+export function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildInstallCommand(rawBaseUrl: string, token: string): string {
+  let safeUrl = window.location.origin;
+  try {
+    const u = new URL(rawBaseUrl || window.location.origin);
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      safeUrl = u.origin + u.pathname.replace(/\/+$/, "");
+    }
+  } catch {
+    // fallback to origin
+  }
+  return `curl -fsSL ${shellQuote(`${safeUrl}/install.sh`)} | sudo sh -s -- \\\n  --url ${shellQuote(safeUrl)} --token ${shellQuote(token)}`;
+}
+
 export function formatBytes(bytes: number): string {
-  if (!bytes || bytes <= 0) return "0 B";
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
   let v = bytes;
@@ -137,7 +215,8 @@ export function formatBytes(bytes: number): string {
 }
 
 export function formatUptime(sec: number): string {
-  if (!sec || sec <= 0) return "0m";
+  if (!Number.isFinite(sec) || sec <= 0) return "0s";
+  if (sec < 60) return `${Math.floor(sec)}s`;
   const d = Math.floor(sec / 86400);
   const h = Math.floor((sec % 86400) / 3600);
   const m = Math.floor((sec % 3600) / 60);
@@ -147,7 +226,7 @@ export function formatUptime(sec: number): string {
 }
 
 export function formatRelativeTime(tsSec: number): string {
-  if (!tsSec) return "never";
+  if (!Number.isFinite(tsSec) || tsSec <= 0) return "never";
   const diff = Math.max(0, Math.floor(Date.now() / 1000) - tsSec);
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;

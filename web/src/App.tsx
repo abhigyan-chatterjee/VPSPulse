@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { api } from "./api/client";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, setUnauthorizedHandler } from "./api/client";
 import type { AuthStatus, Incident, Probe, VPS } from "./types";
 import { Layout, type TopView } from "./components/Layout";
 import { AddVpsModal } from "./components/AddVpsModal";
@@ -31,6 +31,7 @@ function upsertById<T extends { id: string }>(list: T[], item: T): T[] {
 
 export function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [bootError, setBootError] = useState<string | null>(null);
   const [view, setView] = useState<TopView>("overview");
   const [selectedVpsId, setSelectedVpsId] = useState<string | null>(null);
   const [vpsList, setVpsList] = useState<VPS[]>([]);
@@ -40,26 +41,43 @@ export function App() {
   const [addVpsOpen, setAddVpsOpen] = useState(false);
   const [probeModalVpsId, setProbeModalVpsId] = useState<string | null | undefined>(undefined);
   const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("vpspulse_theme");
-    return saved ? saved === "dark" : true;
+    try {
+      const saved = localStorage.getItem("vpspulse_theme");
+      return saved ? saved === "dark" : true;
+    } catch {
+      return true;
+    }
   });
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark);
-    localStorage.setItem("vpspulse_theme", dark ? "dark" : "light");
+    try {
+      localStorage.setItem("vpspulse_theme", dark ? "dark" : "light");
+    } catch {
+      // ignore storage errors in private contexts
+    }
   }, [dark]);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
-    setTimeout(() => {
-      setToast((cur) => (cur === msg ? null : cur));
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
     }, 2800);
   }, []);
 
   const loadAuth = useCallback(async () => {
     const st = await api.authStatus();
     setAuth(st);
+    setBootError(null);
     return st;
   }, []);
 
@@ -74,20 +92,53 @@ export function App() {
     setIncidents(inc);
   }, []);
 
-  useEffect(() => {
-    loadAuth()
-      .then((st) => {
-        if (st.authenticated) return loadData();
-      })
-      .catch(() => {});
+  const bootstrap = useCallback(async () => {
+    setBootError(null);
+    try {
+      const st = await loadAuth();
+      if (st.authenticated) {
+        await loadData();
+      }
+    } catch (err) {
+      setBootError(err instanceof Error ? err.message : "Failed to connect to VPSPulse hub");
+    }
   }, [loadAuth, loadData]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setAuth((prev) => (prev ? { ...prev, authenticated: false, username: "" } : prev));
+      setSseConnected(false);
+    });
+    return () => setUnauthorizedHandler(null);
+  }, []);
+
+  useEffect(() => {
+    bootstrap();
+  }, [bootstrap]);
 
   // Live SSE updates when authenticated.
   useEffect(() => {
     if (!auth?.authenticated) return;
+    let hadError = false;
+    let lastAuthCheck = 0;
+
     const es = new EventSource("/api/v1/events", { withCredentials: true });
-    es.onopen = () => setSseConnected(true);
-    es.onerror = () => setSseConnected(false);
+    es.onopen = () => {
+      setSseConnected(true);
+      if (hadError) {
+        hadError = false;
+        loadData().catch(() => {});
+      }
+    };
+    es.onerror = () => {
+      setSseConnected(false);
+      hadError = true;
+      const now = Date.now();
+      if (now - lastAuthCheck > 5000) {
+        lastAuthCheck = now;
+        loadAuth().catch(() => {});
+      }
+    };
 
     es.addEventListener("connected", () => setSseConnected(true));
     es.addEventListener("vps_update", (ev) => {
@@ -102,7 +153,17 @@ export function App() {
       try {
         const { id } = JSON.parse((ev as MessageEvent).data) as { id: string };
         setVpsList((prev) => prev.filter((x) => x.id !== id));
-      } catch {}
+        setSelectedVpsId((cur) => {
+          if (cur === id) {
+            setView("overview");
+            showToast("VPS was deleted");
+            return null;
+          }
+          return cur;
+        });
+      } catch {
+        // ignore
+      }
     });
     es.addEventListener("probe_update", (ev) => {
       try {
@@ -116,7 +177,9 @@ export function App() {
             ),
           );
         }
-      } catch {}
+      } catch {
+        // ignore
+      }
     });
     es.addEventListener("probe_deleted", (ev) => {
       try {
@@ -125,7 +188,9 @@ export function App() {
         setVpsList((prev) =>
           prev.map((v) => ({ ...v, probes: v.probes.filter((p) => p.id !== id) })),
         );
-      } catch {}
+      } catch {
+        // ignore
+      }
     });
     es.addEventListener("incident_update", (ev) => {
       try {
@@ -134,14 +199,33 @@ export function App() {
           const rest = prev.filter((x) => x.id !== inc.id);
           return [inc, ...rest];
         });
-      } catch {}
+      } catch {
+        // ignore
+      }
     });
 
     return () => {
       es.close();
       setSseConnected(false);
     };
-  }, [auth?.authenticated]);
+  }, [auth?.authenticated, loadAuth, loadData, showToast]);
+
+  if (bootError && !auth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4 bg-[var(--bg)]">
+        <div className="max-w-sm w-full rounded-xl border border-[var(--border)] bg-[var(--card)] p-6 space-y-3 text-xs text-center">
+          <p className="font-semibold text-[var(--error)]">Unable to reach VPSPulse</p>
+          <p className="text-[var(--muted)]">{bootError}</p>
+          <button
+            onClick={bootstrap}
+            className="px-3.5 py-1.5 rounded bg-[var(--primary)] text-[var(--primary-fg)] font-medium cursor-pointer"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!auth) {
     return (
@@ -186,6 +270,15 @@ export function App() {
       onOpenAddVps={() => setAddVpsOpen(true)}
       onLogout={handleLogout}
     >
+      {bootError && (
+        <div className="mb-4 rounded-lg border border-[var(--error)]/40 bg-[var(--error)]/10 px-3.5 py-2 text-xs text-[var(--error)] flex items-center justify-between">
+          <span>{bootError}</span>
+          <button onClick={bootstrap} className="underline cursor-pointer">
+            Retry
+          </button>
+        </div>
+      )}
+
       {view === "overview" && (
         <OverviewPage
           vpsList={vpsList}
@@ -197,15 +290,22 @@ export function App() {
           }}
           onAddStandaloneProbe={() => setProbeModalVpsId(null)}
           onAddVps={() => setAddVpsOpen(true)}
+          onProbeUpdated={(prb) => setStandaloneProbes((prev) => upsertById(prev, prb))}
+          onProbeDeleted={(id) => setStandaloneProbes((prev) => prev.filter((p) => p.id !== id))}
+          onToast={showToast}
         />
       )}
 
       {view === "detail" && activeVps && (
         <VpsDetailPage
+          key={activeVps.id}
           vps={activeVps}
           publicUrl={auth.public_url}
-          onBack={() => setView("overview")}
-          onUpdated={(updated) => setVpsList((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))}
+          onBack={() => {
+            setSelectedVpsId(null);
+            setView("overview");
+          }}
+          onUpdated={(updated) => setVpsList((prev) => upsertById(prev, updated))}
           onDeleted={(id) => {
             setVpsList((prev) => prev.filter((x) => x.id !== id));
             setSelectedVpsId(null);
@@ -236,23 +336,24 @@ export function App() {
         onToast={showToast}
       />
 
-      <AddProbeModal
-        open={probeModalVpsId !== undefined}
-        vpsId={probeModalVpsId ?? null}
-        onClose={() => setProbeModalVpsId(undefined)}
-        onCreated={(prb) => {
-          if (!prb.vps_id) {
-            setStandaloneProbes((prev) => upsertById(prev, prb));
-          } else {
-            setVpsList((prev) =>
-              prev.map((v) =>
-                v.id === prb.vps_id ? { ...v, probes: upsertById(v.probes, prb) } : v,
-              ),
-            );
-          }
-          showToast(`Probe ${prb.name} created`);
-        }}
-      />
+      {probeModalVpsId !== undefined && (
+        <AddProbeModal
+          vpsId={probeModalVpsId}
+          onClose={() => setProbeModalVpsId(undefined)}
+          onCreated={(prb) => {
+            if (!prb.vps_id) {
+              setStandaloneProbes((prev) => upsertById(prev, prb));
+            } else {
+              setVpsList((prev) =>
+                prev.map((v) =>
+                  v.id === prb.vps_id ? { ...v, probes: upsertById(v.probes, prb) } : v,
+                ),
+              );
+            }
+            showToast(`Probe ${prb.name} created`);
+          }}
+        />
+      )}
 
       {toast && (
         <div className="fixed bottom-5 right-5 z-50 px-3.5 py-2.5 rounded-lg border border-[var(--border)] bg-[var(--card)] text-xs shadow-xl flex items-center gap-2">
