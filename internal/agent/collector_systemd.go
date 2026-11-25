@@ -3,7 +3,10 @@ package agent
 import (
 	"bufio"
 	"context"
+	"math"
+	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +16,8 @@ import (
 	"vpspulse/internal/protocol"
 )
 
+var validAgentUnitRe = regexp.MustCompile(`^[A-Za-z0-9:_@.-]{1,256}$`)
+
 // CmdRunner executes a shell command and returns stdout.
 type CmdRunner func(ctx context.Context, name string, args ...string) (string, error)
 
@@ -20,6 +25,7 @@ type CmdRunner func(ctx context.Context, name string, args ...string) (string, e
 type SystemdCollector struct {
 	run          CmdRunner
 	lookPath     func(string) (string, error)
+	isBooted     func() bool
 	mu           sync.Mutex
 	cachedUnits  []string
 	lastDiscover time.Time
@@ -29,6 +35,10 @@ type SystemdCollector struct {
 func NewSystemdCollector() *SystemdCollector {
 	return &SystemdCollector{
 		lookPath: exec.LookPath,
+		isBooted: func() bool {
+			info, err := os.Stat("/run/systemd/system")
+			return err == nil && info.IsDir()
+		},
 		run: func(ctx context.Context, name string, args ...string) (string, error) {
 			cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			defer cancel()
@@ -38,15 +48,28 @@ func NewSystemdCollector() *SystemdCollector {
 	}
 }
 
-// Collect gathers watchedUnits plus any auto-detected failed units and periodic discoverable service names.
+func normalizeUnitName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.HasPrefix(name, "-") || !validAgentUnitRe.MatchString(name) {
+		return ""
+	}
+	if !strings.Contains(name, ".") {
+		name += ".service"
+	}
+	return name
+}
+
+// Collect gathers watchedUnits plus any auto-detected failed units and periodic discoverable service/timer/socket names.
 func (s *SystemdCollector) Collect(ctx context.Context, watchedUnits []string) (available bool, units []protocol.SystemdUnitReport, discoverable []string) {
+	if s.isBooted != nil && !s.isBooted() {
+		return false, nil, nil
+	}
 	if _, err := s.lookPath("systemctl"); err != nil {
 		return false, nil, nil
 	}
 
-	failedOut, err := s.run(ctx, "systemctl", "list-units", "--type=service", "--state=failed", "--no-legend", "--no-pager", "--plain")
+	failedOut, err := s.run(ctx, "systemctl", "list-units", "--type=service,timer,socket", "--state=failed", "--no-legend", "--no-pager", "--plain")
 	if err != nil {
-		// Still check if systemctl is responsive at all; if not, mark unavailable.
 		if _, verErr := s.run(ctx, "systemctl", "--version"); verErr != nil {
 			return false, nil, nil
 		}
@@ -60,18 +83,20 @@ func (s *SystemdCollector) Collect(ctx context.Context, watchedUnits []string) (
 	watchedSet := map[string]bool{}
 	targetSet := map[string]bool{}
 	for _, w := range watchedUnits {
-		w = strings.TrimSpace(w)
-		if w != "" {
-			watchedSet[w] = true
-			targetSet[w] = true
+		norm := normalizeUnitName(w)
+		if norm != "" {
+			watchedSet[norm] = true
+			targetSet[norm] = true
 		}
 	}
 	for _, f := range failedNames {
-		targetSet[f] = true
+		if norm := normalizeUnitName(f); norm != "" {
+			targetSet[norm] = true
+		}
 	}
 
 	if len(targetSet) > 0 {
-		args := []string{"show", "--property=Id,ActiveState,SubState,MemoryCurrent,ActiveEnterTimestamp"}
+		args := []string{"show", "--property=Id,ActiveState,SubState,MemoryCurrent,ActiveEnterTimestamp", "--"}
 		sorted := make([]string, 0, len(targetSet))
 		for name := range targetSet {
 			sorted = append(sorted, name)
@@ -79,26 +104,32 @@ func (s *SystemdCollector) Collect(ctx context.Context, watchedUnits []string) (
 		sort.Strings(sorted)
 		args = append(args, sorted...)
 		if showOut, err := s.run(ctx, "systemctl", args...); err == nil {
-			units = ParseSystemctlShow(showOut)
-			for i := range units {
-				if failedSet[units[i].Name] && !watchedSet[units[i].Name] {
-					units[i].AutoFailed = true
+			parsed := ParseSystemctlShow(showOut)
+			seen := map[string]bool{}
+			for _, u := range parsed {
+				if seen[u.Name] {
+					continue
 				}
+				seen[u.Name] = true
+				if failedSet[u.Name] && !watchedSet[u.Name] {
+					u.AutoFailed = true
+				}
+				units = append(units, u)
 			}
 		}
 	}
 
 	s.mu.Lock()
-	shouldDiscover := time.Since(s.lastDiscover) > 5*time.Minute || len(s.cachedUnits) == 0
+	shouldDiscover := s.lastDiscover.IsZero() || time.Since(s.lastDiscover) > 5*time.Minute
 	s.mu.Unlock()
 	if shouldDiscover {
-		if listOut, err := s.run(ctx, "systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"); err == nil {
-			parsed := ParseUnitFiles(listOut)
-			s.mu.Lock()
-			s.cachedUnits = parsed
-			s.lastDiscover = time.Now()
-			s.mu.Unlock()
+		listOut, err := s.run(ctx, "systemctl", "list-unit-files", "--type=service,timer,socket", "--no-legend", "--no-pager")
+		s.mu.Lock()
+		s.lastDiscover = time.Now()
+		if err == nil {
+			s.cachedUnits = ParseUnitFiles(listOut)
 		}
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()
@@ -107,20 +138,24 @@ func (s *SystemdCollector) Collect(ctx context.Context, watchedUnits []string) (
 	return true, units, discoverable
 }
 
+func isSupportedUnitSuffix(name string) bool {
+	return strings.HasSuffix(name, ".service") || strings.HasSuffix(name, ".timer") || strings.HasSuffix(name, ".socket")
+}
+
 // ParseFailedUnits extracts unit names from `systemctl list-units --state=failed --no-legend --plain`.
 func ParseFailedUnits(out string) []string {
 	var names []string
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) > 0 && strings.HasSuffix(fields[0], ".service") {
+		if len(fields) > 0 && isSupportedUnitSuffix(fields[0]) {
 			names = append(names, fields[0])
 		}
 	}
 	return names
 }
 
-// ParseUnitFiles extracts discoverable .service unit names from `systemctl list-unit-files --type=service --no-legend`.
+// ParseUnitFiles extracts discoverable unit names from `systemctl list-unit-files --no-legend`.
 func ParseUnitFiles(out string) []string {
 	seen := map[string]bool{}
 	var names []string
@@ -131,7 +166,7 @@ func ParseUnitFiles(out string) []string {
 			continue
 		}
 		name := fields[0]
-		if !strings.HasSuffix(name, ".service") || strings.Contains(name, "@.") || seen[name] {
+		if !isSupportedUnitSuffix(name) || strings.Contains(name, "@.") || seen[name] {
 			continue
 		}
 		seen[name] = true
@@ -176,7 +211,7 @@ func ParseSystemctlShow(out string) []protocol.SystemdUnitReport {
 		case "SubState":
 			cur.SubState = v
 		case "MemoryCurrent":
-			if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if n, err := strconv.ParseUint(v, 10, 64); err == nil && n != math.MaxUint64 {
 				cur.MemBytes = n
 			}
 		case "ActiveEnterTimestamp":

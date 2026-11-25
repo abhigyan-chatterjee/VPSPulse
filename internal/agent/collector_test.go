@@ -13,8 +13,8 @@ import (
 )
 
 func TestProcParsers(t *testing.T) {
-	stat1 := "cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 50 0 25 425 0 0 0 0 0 0\n"
-	stat2 := "cpu  140 0 60 900 0 0 0 0 0 0\n"
+	stat1 := "cpu  100 0 50 850 0 0 0 0 25 0\ncpu0 50 0 25 425 0 0 0 0 0 0\n"
+	stat2 := "cpu  140 0 60 900 0 0 0 0 40 0\n"
 	c1 := ParseProcStat(stat1)
 	c2 := ParseProcStat(stat2)
 	pct := computeCPUPercent(c1, c2)
@@ -139,7 +139,7 @@ func TestSystemdCollectorParsersAndCollect(t *testing.T) {
 					"Id=logrotate.service",
 					"ActiveState=failed",
 					"SubState=failed",
-					"MemoryCurrent=[not set]",
+					"MemoryCurrent=18446744073709551615",
 					"ActiveEnterTimestamp=",
 				}, "\n"), nil
 			}
@@ -154,8 +154,8 @@ func TestSystemdCollectorParsersAndCollect(t *testing.T) {
 	if units[0].Name != "caddy.service" || units[0].AutoFailed {
 		t.Fatalf("unexpected watched unit: %+v", units[0])
 	}
-	if units[1].Name != "logrotate.service" || !units[1].AutoFailed {
-		t.Fatalf("expected logrotate.service flagged AutoFailed: %+v", units[1])
+	if units[1].Name != "logrotate.service" || !units[1].AutoFailed || units[1].MemBytes != 0 {
+		t.Fatalf("expected logrotate.service flagged AutoFailed with MemBytes=0 (MaxUint64 ignored): %+v", units[1])
 	}
 	if len(discoverable) != 2 || discoverable[0] != "caddy.service" || discoverable[1] != "ssh.service" {
 		t.Fatalf("unexpected discoverable units: %+v", discoverable)
